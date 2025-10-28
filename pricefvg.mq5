@@ -59,6 +59,20 @@ struct PositionInfo
 };
 PositionInfo positionTracker[];
 
+string MarketBias = "NEUTRAL";
+int LastBreakoutDir = 0;
+double lastSwingHighPrice = 0.0;
+double lastSwingLowPrice = 0.0;
+datetime lastSwingHighTime = 0;
+datetime lastSwingLowTime = 0;
+datetime lastBreakoutTime = 0;
+datetime lastContextBarTime = 0;
+datetime lastFVGTime = 0;
+
+bool UpdateMarketContext(bool forceRefresh, bool &breakoutChanged);
+bool LoadMarketContextFromHistory();
+void ClosePositionsForSymbolAndMagic(string symbol, int magic, const string reason);
+
 //+------------------------------------------------------------------+
 //| Expert initialization                                            |
 //+------------------------------------------------------------------+
@@ -100,6 +114,22 @@ int OnInit()
    Print("========================================");
    
    ArrayResize(positionTracker, 0);
+
+   bool breakoutChanged = false;
+   if(!UpdateMarketContext(true, breakoutChanged))
+   {
+      Print("⚠️ Unable to build initial market context (insufficient historical data). Bias remains NEUTRAL.");
+   }
+   else
+   {
+      PrintFormat("Structure initialized -> Bias=%s | SwingHigh=%.5f | SwingLow=%.5f",
+                  MarketBias, lastSwingHighPrice, lastSwingLowPrice);
+      if(fvgDirection != 0)
+         PrintFormat("Initial FVG (%s) %.5f-%.5f",
+                     fvgDirection == 1 ? "bullish" : "bearish", fvgLow, fvgHigh);
+      else
+         Print("No qualifying FVG found within initialization window.");
+   }
    return INIT_SUCCEEDED;
 }
 
@@ -122,14 +152,13 @@ void OnDeinit(const int reason)
 void OnTick()
 {
    tickCounter++;
-   
-   if(EnableDebugPrints && tickCounter % DebugPrintInterval == 0)
+
+   bool breakoutChanged = false;
+   if(UpdateMarketContext(false, breakoutChanged) && breakoutChanged)
    {
-      Print("--- PERIODIC STATUS (Tick ", tickCounter, ") ---");
-      PrintFormat("  Time: %s", TimeToString(TimeCurrent(), TIME_DATE|TIME_SECONDS));
-      PrintFormat("  Equity: %.2f | Peak: %.2f | StopTrading: %s", 
-                  equity, EquityPeak, StopTrading ? "YES" : "NO");
-      PrintFormat("  Open Positions: %d", CountPositionsForSymbolAndMagic(_Symbol, MagicNumber));
+      ClosePositionsForSymbolAndMagic(_Symbol, MagicNumber, "opposite breakout");
+      if(EnableDebugPrints)
+         PrintFormat("📈 Market bias updated to %s after breakout.", MarketBias);
    }
 
    equity = AccountInfoDouble(ACCOUNT_EQUITY);
@@ -227,48 +256,58 @@ void OnTick()
 
    if(fvgDirection != 0)
    {
-      double price = bid;
-      double fvgHeight = MathAbs(fvgHigh - fvgLow);
-      double tolerance = fvgHeight * RetraceTolerancePct;
-
-      if(fvgDirection == 1)
+      if(LastBreakoutDir != 0 && fvgDirection != LastBreakoutDir)
       {
-         bool inZone = (price <= fvgHigh + tolerance && price >= fvgLow - tolerance);
-         bool momentum = (AllowMomentumEntry && price > fvgHigh);
-
-         if(inZone)
-         {
-            if(EnableDebugPrints)
-               PrintFormat("🟢 BULLISH ENTRY: %.5f in zone", price);
-            PlaceMarketTrade(1, highRange, lowRange, atr);
-            fvgDirection = 0;
-         }
-         else if(momentum)
-         {
-            if(EnableDebugPrints)
-               PrintFormat("🟢 MOMENTUM: %.5f > %.5f", price, fvgHigh);
-            PlaceMarketTrade(1, highRange, lowRange, atr);
-            fvgDirection = 0;
-         }
+         if(EnableDebugPrints)
+            PrintFormat("⚖️ FVG direction (%s) not aligned with bias (%s). Waiting for alignment.",
+                        fvgDirection == 1 ? "BUY" : "SELL", MarketBias);
+         fvgDirection = 0;
       }
-      else if(fvgDirection == -1)
+      else
       {
-         bool inZone = (price >= fvgLow - tolerance && price <= fvgHigh + tolerance);
-         bool momentum = (AllowMomentumEntry && price < fvgLow);
+         double price = bid;
+         double fvgHeight = MathAbs(fvgHigh - fvgLow);
+         double tolerance = fvgHeight * RetraceTolerancePct;
 
-         if(inZone)
+         if(fvgDirection == 1)
          {
-            if(EnableDebugPrints)
-               PrintFormat("🔴 BEARISH ENTRY: %.5f in zone", price);
-            PlaceMarketTrade(-1, highRange, lowRange, atr);
-            fvgDirection = 0;
+            bool inZone = (price <= fvgHigh + tolerance && price >= fvgLow - tolerance);
+            bool momentum = (AllowMomentumEntry && price > fvgHigh);
+
+            if(inZone)
+            {
+               if(EnableDebugPrints)
+                  PrintFormat("🟢 BULLISH ENTRY: %.5f in zone", price);
+               PlaceMarketTrade(1, highRange, lowRange, atr);
+               fvgDirection = 0;
+            }
+            else if(momentum)
+            {
+               if(EnableDebugPrints)
+                  PrintFormat("🟢 MOMENTUM: %.5f > %.5f", price, fvgHigh);
+               PlaceMarketTrade(1, highRange, lowRange, atr);
+               fvgDirection = 0;
+            }
          }
-         else if(momentum)
+         else if(fvgDirection == -1)
          {
-            if(EnableDebugPrints)
-               PrintFormat("🔴 MOMENTUM: %.5f < %.5f", price, fvgLow);
-            PlaceMarketTrade(-1, highRange, lowRange, atr);
-            fvgDirection = 0;
+            bool inZone = (price >= fvgLow - tolerance && price <= fvgHigh + tolerance);
+            bool momentum = (AllowMomentumEntry && price < fvgLow);
+
+            if(inZone)
+            {
+               if(EnableDebugPrints)
+                  PrintFormat("🔴 BEARISH ENTRY: %.5f in zone", price);
+               PlaceMarketTrade(-1, highRange, lowRange, atr);
+               fvgDirection = 0;
+            }
+            else if(momentum)
+            {
+               if(EnableDebugPrints)
+                  PrintFormat("🔴 MOMENTUM: %.5f < %.5f", price, fvgLow);
+               PlaceMarketTrade(-1, highRange, lowRange, atr);
+               fvgDirection = 0;
+            }
          }
       }
    }
@@ -464,35 +503,35 @@ int DetectBreakout(double highRange, double lowRange)
 //+------------------------------------------------------------------+
 bool DetectFVG(int &direction, double &zoneHigh, double &zoneLow)
 {
-   if(Bars(_Symbol, PERIOD_CURRENT) < 4) return false;
+   int totalBars = Bars(_Symbol, PERIOD_CURRENT);
+   if(totalBars < 5) return false;
 
-   double high2 = iHigh(_Symbol, PERIOD_CURRENT, 2);
-   double low2  = iLow(_Symbol, PERIOD_CURRENT, 2);
-   double high1 = iHigh(_Symbol, PERIOD_CURRENT, 1);
-   double low1  = iLow(_Symbol, PERIOD_CURRENT, 1);
+   double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   double epsilon = (point > 0.0) ? point * 0.5 : 1e-6;
 
-   double overlapTolerance = 0.3;
-   
-   double bullishGap = low1 - high2;
-   double bar2Range = high2 - low2;
-   if(bar2Range > 0 && bullishGap >= -bar2Range * overlapTolerance)
+   for(int shift = 1; shift + 2 < totalBars; ++shift)
    {
-      direction = 1;
-      zoneHigh = low1;
-      zoneLow  = high2;
-      return true;
-   }
+      double newestLow = iLow(_Symbol, PERIOD_CURRENT, shift);
+      double newestHigh = iHigh(_Symbol, PERIOD_CURRENT, shift);
+      double oldestHigh = iHigh(_Symbol, PERIOD_CURRENT, shift + 2);
+      double oldestLow = iLow(_Symbol, PERIOD_CURRENT, shift + 2);
 
-   double bearishGap = low2 - high1;
-   double bar1Range = high1 - low1;
-   if(bar1Range > 0 && bearishGap >= -bar1Range * overlapTolerance)
-   {
-      direction = -1;
-      zoneHigh = low2;
-      zoneLow  = high1;
-      return true;
-   }
+      if(newestLow > oldestHigh + epsilon)
+      {
+         direction = 1;
+         zoneLow = oldestHigh;
+         zoneHigh = newestLow;
+         return true;
+      }
 
+      if(newestHigh + epsilon < oldestLow)
+      {
+         direction = -1;
+         zoneHigh = oldestLow;
+         zoneLow = newestHigh;
+         return true;
+      }
+   }
    return false;
 }
 
@@ -750,6 +789,204 @@ void SyncPositionTracker()
          double risk = MathAbs(entry - sl);
          AddToTracker(ticket, entry, sl, risk);
       }
+   }
+}
+
+bool UpdateMarketContext(bool forceRefresh, bool &breakoutChanged)
+{
+   breakoutChanged = false;
+
+   datetime lastClosedBarTime = iTime(_Symbol, PERIOD_CURRENT, 1);
+   if(lastClosedBarTime == 0)
+      return false;
+
+   if(!forceRefresh && lastContextBarTime == lastClosedBarTime)
+      return true;
+
+   int previousBreakout = LastBreakoutDir;
+   if(!LoadMarketContextFromHistory())
+      return false;
+
+   lastContextBarTime = lastClosedBarTime;
+
+   if(!forceRefresh && previousBreakout != 0 && LastBreakoutDir != 0 && LastBreakoutDir != previousBreakout)
+      breakoutChanged = true;
+
+   return true;
+}
+
+bool LoadMarketContextFromHistory()
+{
+   const int MIN_LOOKBACK = 200;
+   int totalBars = Bars(_Symbol, PERIOD_CURRENT);
+   if(totalBars < 5)
+      return false;
+
+   int barsToCopy = MathMin(totalBars, 500);
+   if(barsToCopy < MIN_LOOKBACK)
+      PrintFormat("⚠️ Only %d bars available; attempting context build with reduced history.", barsToCopy);
+
+   MqlRates rates[];
+   int copied = CopyRates(_Symbol, PERIOD_CURRENT, 0, barsToCopy, rates);
+   if(copied < 5)
+   {
+      PrintFormat("⚠️ CopyRates failed. Copied=%d LastError=%d", copied, GetLastError());
+      return false;
+   }
+   ArraySetAsSeries(rates, true);
+
+   lastSwingHighPrice = 0.0;
+   lastSwingLowPrice = 0.0;
+   lastSwingHighTime = 0;
+   lastSwingLowTime = 0;
+   lastBreakoutTime = 0;
+   MarketBias = "NEUTRAL";
+
+   for(int i = 2; i < copied - 2; ++i)
+   {
+      if(lastSwingHighPrice == 0.0)
+      {
+         if(rates[i].high > rates[i+1].high && rates[i].high >= rates[i-1].high)
+         {
+            lastSwingHighPrice = rates[i].high;
+            lastSwingHighTime = rates[i].time;
+         }
+      }
+
+      if(lastSwingLowPrice == 0.0)
+      {
+         if(rates[i].low < rates[i+1].low && rates[i].low <= rates[i-1].low)
+         {
+            lastSwingLowPrice = rates[i].low;
+            lastSwingLowTime = rates[i].time;
+         }
+      }
+
+      if(lastSwingHighPrice != 0.0 && lastSwingLowPrice != 0.0)
+         break;
+   }
+
+   double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   double epsilon = (point > 0.0) ? point * 0.5 : 1e-6;
+
+   LastBreakoutDir = 0;
+   for(int i = 1; i < copied; ++i)
+   {
+      datetime barTime = rates[i].time;
+      double closePrice = rates[i].close;
+
+      bool bullishBreak = (lastSwingHighTime > 0 && barTime > lastSwingHighTime && closePrice > lastSwingHighPrice + epsilon);
+      bool bearishBreak = (lastSwingLowTime > 0 && barTime > lastSwingLowTime && closePrice < lastSwingLowPrice - epsilon);
+
+      if(bullishBreak || bearishBreak)
+      {
+         LastBreakoutDir = bullishBreak ? 1 : -1;
+         lastBreakoutTime = barTime;
+         break;
+      }
+   }
+
+   MarketBias = (LastBreakoutDir == 1) ? "BUY" : (LastBreakoutDir == -1 ? "SELL" : "NEUTRAL");
+
+   fvgDirection = 0;
+   fvgHigh = 0.0;
+   fvgLow = 0.0;
+   lastFVGTime = 0;
+   for(int i = 1; i + 2 < copied; ++i)
+   {
+      double newestLow = rates[i].low;
+      double newestHigh = rates[i].high;
+      double oldestHigh = rates[i+2].high;
+      double oldestLow = rates[i+2].low;
+
+      if(newestLow > oldestHigh + epsilon)
+      {
+         fvgDirection = 1;
+         fvgLow = oldestHigh;
+         fvgHigh = newestLow;
+         lastFVGTime = rates[i].time;
+         break;
+      }
+
+      if(newestHigh + epsilon < oldestLow)
+      {
+         fvgDirection = -1;
+         fvgHigh = oldestLow;
+         fvgLow = newestHigh;
+         lastFVGTime = rates[i].time;
+         break;
+      }
+   }
+
+   if(EnableDebugPrints)
+   {
+      PrintFormat("Structure scan: SwingHigh=%.5f (%s) | SwingLow=%.5f (%s)",
+                  lastSwingHighPrice,
+                  lastSwingHighTime > 0 ? TimeToString(lastSwingHighTime, TIME_DATE|TIME_MINUTES) : "n/a",
+                  lastSwingLowPrice,
+                  lastSwingLowTime > 0 ? TimeToString(lastSwingLowTime, TIME_DATE|TIME_MINUTES) : "n/a");
+      PrintFormat("Bias set to %s (BreakoutDir=%d @ %s)",
+                  MarketBias,
+                  LastBreakoutDir,
+                  lastBreakoutTime > 0 ? TimeToString(lastBreakoutTime, TIME_DATE|TIME_MINUTES) : "n/a");
+      if(fvgDirection != 0)
+         PrintFormat("FVG %s zone: %.5f - %.5f (%s)",
+                     fvgDirection == 1 ? "bullish" : "bearish",
+                     fvgLow, fvgHigh,
+                     TimeToString(lastFVGTime, TIME_DATE|TIME_MINUTES));
+      else
+         Print("FVG: none detected in lookback window.");
+   }
+
+   return true;
+}
+
+void ClosePositionsForSymbolAndMagic(string symbol, int magic, const string reason)
+{
+   trade.SetExpertMagicNumber(magic);
+   trade.SetAsyncMode(false);
+
+   int total = PositionsTotal();
+   int closed = 0;
+
+   for(int i = total - 1; i >= 0; --i)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(!PositionSelectByTicket(ticket))
+         continue;
+
+      if(PositionGetString(POSITION_SYMBOL) != symbol)
+         continue;
+
+      if((int)PositionGetInteger(POSITION_MAGIC) != magic)
+         continue;
+
+      double volume = PositionGetDouble(POSITION_VOLUME);
+      if(volume <= 0.0)
+         continue;
+
+      ResetLastError();
+      if(trade.PositionClose(ticket))
+      {
+         closed++;
+         PrintFormat("🔄 Closed ticket=%I64u due to %s", ticket, reason);
+         RemoveFromTracker(ticket);
+      }
+      else
+      {
+         PrintFormat("⚠️ Failed to close ticket=%I64u due to %s. Err=%d RetCode=%d %s",
+                     ticket,
+                     reason,
+                     GetLastError(),
+                     trade.ResultRetcode(),
+                     trade.ResultRetcodeDescription());
+      }
+   }
+
+   if(closed > 0)
+   {
+      SyncPositionTracker();
+      PrintFormat("ℹ️ Closed %d position(s) because of %s. Current bias=%s", closed, reason, MarketBias);
    }
 }
 //+------------------------------------------------------------------+
