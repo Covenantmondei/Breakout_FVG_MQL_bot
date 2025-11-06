@@ -37,8 +37,36 @@ input double   TrailATRMult              = 0.5;
 input bool     EnableDebugPrints         = true;
 input int      DebugPrintInterval        = 100;
 
+input bool     UseTrendFilter           = true;
+input int      TrendMAPeriod            = 50;
+input ENUM_TIMEFRAMES TrendMATimeframe  = PERIOD_H1;
+input double   TrendSlopeMinPoints      = 100;
+
+input bool     EnableAdxMarketFilter    = true;
+input int      AdxPeriod                = 14;
+input double   AdxTrendingThreshold     = 22.0;
+
+input bool     UseNewsBlackout          = true;
+input string   NewsBlackoutWindows      = "12:25-13:05;14:25-14:45";
+
+input bool     EnforceDirectionalCap    = true;
+input int      MaxTradesPerDirection    = 2;
+
+input bool     UseDynamicAtrStops       = true;
+input double   DynamicSlAtrMult         = 1.5;
+input double   DynamicTpAtrMult         = 2.0;
+
+input bool     UseBreakevenPips         = true;
+input double   BreakevenTriggerPips     = 50.0;
+input bool     UseAtrTrailing           = true;
+input double   TrailAtrMultiplier       = 0.75;
+input bool     EnablePartialClose       = true;
+input double   PartialCloseFraction     = 0.5;
+
 // ------------------------ Globals ------------------
 int atrHandle = INVALID_HANDLE;
+int maHandle = INVALID_HANDLE;
+int adxHandle = INVALID_HANDLE;
 double equity = 0.0;
 double EquityPeak = 0.0;
 bool StopTrading = false;
@@ -48,6 +76,27 @@ double fvgHigh = 0.0;
 double fvgLow  = 0.0;
 int    fvgDirection = 0;
 int    tickCounter = 0;
+double recentFvgHeights[];
+const int MAX_FVG_HISTORY = 10;
+
+
+//-------------------License Code Start----------------------//
+#import "MetaTraderValidation.ex5"
+bool Validate(string licenseKey);
+// void updateConnectionStatus(string licenseKey);
+bool Validate(string licenseKey, string productCode);
+// void updateHardwareId(string licenseKey);
+// void updateConnectionStatusConnected(string licenseKey);
+// void updateConnectionStatusDisconnected(string licenseKey);
+#import
+bool auth = false;
+string LicenseKeyActive = "";
+
+input string strMA1="---------------------------------------- License Input ----------------------------------------";
+input string licensekey = "";
+string ProductCode = "2";
+//----------------License Code End--------------------------//
+
 
 struct PositionInfo
 {
@@ -56,6 +105,9 @@ struct PositionInfo
    double   originalSL;
    double   risk;
    bool     breakevenSet;
+   double   fvgUpper;
+   double   fvgLower;
+   bool     partialClosed; 
 };
 PositionInfo positionTracker[];
 
@@ -69,26 +121,59 @@ datetime lastBreakoutTime = 0;
 datetime lastContextBarTime = 0;
 datetime lastFVGTime = 0;
 
+const int NYSessionStartHour   = 13;
+const int NYSessionStartMinute = 0;
+const int NYSessionEndHour     = 21;
+const int NYSessionEndMinute   = 59;
+
 bool UpdateMarketContext(bool forceRefresh, bool &breakoutChanged);
 bool LoadMarketContextFromHistory();
 void ClosePositionsForSymbolAndMagic(string symbol, int magic, const string reason);
+bool IsWithinNewYorkSession();
+void RecordFvgHeight(double height);
+double ComputeRecentFvgMean();
 
 //+------------------------------------------------------------------+
 //| Expert initialization                                            |
 //+------------------------------------------------------------------+
 int OnInit()
 {
+   // auth = false;
+
+   // LicenseKeyActive = licensekey;
+   // StringTrimLeft(LicenseKeyActive);
+   // StringTrimRight(LicenseKeyActive);
+
+   // if(StringLen(LicenseKeyActive) == 0)
+   // {
+   //    Print("License key missing. Please enter your license.");
+   //    return INIT_FAILED;
+   // }
+
+   // if(!Validate(LicenseKeyActive))
+   // {
+   //    Print("License validation failed. Check your key or WebRequest permissions.");
+   //    return INIT_FAILED;
+   // }
+
+   // // updateConnectionStatus(LicenseKeyActive);
+   // // updateConnectionStatusConnected(LicenseKeyActive);
+   // // updateHardwareId(LicenseKeyActive);
+   // auth = true;
+
+
    Print("========================================");
    Print("EA INITIALIZED - Price_Based_EA_XAUUSD (IMPROVED VERSION)");
    Print("========================================");
 
    atrHandle = iATR(_Symbol, ATRTimeframe, ATRPeriod);
-   if(atrHandle == INVALID_HANDLE)
-   {
-      Print("FATAL: Failed to create ATR handle. Error=", GetLastError());
+   maHandle = iMA(_Symbol, TrendMATimeframe, TrendMAPeriod, 0, MODE_EMA, PRICE_CLOSE);
+   adxHandle = iADX(_Symbol, PERIOD_CURRENT, AdxPeriod);
+   if(UseTrendFilter && maHandle == INVALID_HANDLE)
       return INIT_FAILED;
-   }
-   Print("ATR Handle created successfully");
+   if(EnableAdxMarketFilter && adxHandle == INVALID_HANDLE)
+      return INIT_FAILED;
+   Print("ATR, MA, and ADX Handles created successfully");
 
    equity = AccountInfoDouble(ACCOUNT_EQUITY);
    EquityPeak = equity;
@@ -111,6 +196,8 @@ int OnInit()
    PrintFormat("  StopTradingAfterWin: %s", StopTradingAfterWin ? "YES" : "NO");
    PrintFormat("  StopTradingAfterLoss: %s", StopTradingAfterLoss ? "YES" : "NO");
    PrintFormat("  RequireBreakoutFVGAlign: %s", RequireBreakoutFVGAlign ? "YES" : "NO");
+   PrintFormat("  Trading window (server): %02d:%02d - %02d:%02d (New York session)",
+               NYSessionStartHour, NYSessionStartMinute, NYSessionEndHour, NYSessionEndMinute);
    Print("========================================");
    
    ArrayResize(positionTracker, 0);
@@ -138,6 +225,9 @@ int OnInit()
 //+------------------------------------------------------------------+
 void OnDeinit(const int reason)
 {
+   // if(auth && StringLen(LicenseKeyActive) > 0)
+      // updateConnectionStatusDisconnected(LicenseKeyActive);
+
    if(atrHandle != INVALID_HANDLE)
    {
       IndicatorRelease(atrHandle);
@@ -151,6 +241,9 @@ void OnDeinit(const int reason)
 //+------------------------------------------------------------------+
 void OnTick()
 {
+   // if(!auth)
+   //    return;
+
    tickCounter++;
 
    bool breakoutChanged = false;
@@ -165,6 +258,13 @@ void OnTick()
    UpdateEquityPeakAndDaily();
    
    ManageOpenPositions();
+
+   if(!IsWithinNewYorkSession())
+   {
+      if(EnableDebugPrints && tickCounter % DebugPrintInterval == 0)
+         Print("🕑 Outside New York session - entries paused.");
+      return;
+   }
    
    if(StopTrading)
    {
@@ -225,43 +325,34 @@ void OnTick()
 
    int dir; 
    double zHigh, zLow;
-   if(DetectFVG(dir, zHigh, zLow))
+   datetime detectedTime = 0;
+   if(DetectFVG(dir, zHigh, zLow, detectedTime))
    {
-      if(EnableDebugPrints)
-         PrintFormat("🎯 FVG: %s [%.5f-%.5f]", 
-                     dir == 1 ? "BULLISH" : "BEARISH", zLow, zHigh);
-      
-      if(RequireBreakoutFVGAlign)
+      bool isNewFvg = (detectedTime != lastFVGTime);
+
+      if(isNewFvg)
       {
-         if(breakout != 0 && breakout == dir)
-         {
-            fvgDirection = dir;
-            fvgHigh = zHigh;
-            fvgLow  = zLow;
-            if(EnableDebugPrints)
-               Print("✓ FVG ALIGNED");
-         }
-         else
-         {
-            fvgDirection = 0;
-         }
-      }
-      else
-      {
+         if(EnableDebugPrints)
+            PrintFormat("🎯 FVG: %s [%.5f-%.5f] @ %s",
+                        dir == 1 ? "BULLISH" : "BEARISH",
+                        zLow, zHigh,
+                        TimeToString(detectedTime, TIME_DATE|TIME_MINUTES));
+
          fvgDirection = dir;
-         fvgHigh = zHigh;
-         fvgLow  = zLow;
+         fvgHigh      = zHigh;
+         fvgLow       = zLow;
+         lastFVGTime  = detectedTime;
+         RecordFvgHeight(MathAbs(zHigh - zLow));
       }
    }
 
    if(fvgDirection != 0)
    {
-      if(LastBreakoutDir != 0 && fvgDirection != LastBreakoutDir)
+      if(RequireBreakoutFVGAlign && LastBreakoutDir != 0 && fvgDirection != LastBreakoutDir)
       {
-         if(EnableDebugPrints)
+         if(EnableDebugPrints && tickCounter % DebugPrintInterval == 0)
             PrintFormat("⚖️ FVG direction (%s) not aligned with bias (%s). Waiting for alignment.",
                         fvgDirection == 1 ? "BUY" : "SELL", MarketBias);
-         fvgDirection = 0;
       }
       else
       {
@@ -365,7 +456,9 @@ void ManageOpenPositions()
 {
    int total = PositionsTotal();
    SyncPositionTracker();
-   
+   double lastClose = iClose(_Symbol, PERIOD_CURRENT, 1);
+   double atrNow = GetATR(); // reuse ATR across positions
+
    for(int i = total - 1; i >= 0; i--)
    {
       ulong ticket = PositionGetTicket(i);
@@ -376,91 +469,126 @@ void ManageOpenPositions()
       if(posSymbol != _Symbol || (int)posMagic != MagicNumber) continue;
 
       int type = (int)PositionGetInteger(POSITION_TYPE);
-      double openPrice   = PositionGetDouble(POSITION_PRICE_OPEN);
-      double currentPrice= (type == POSITION_TYPE_BUY) ? 
-                           SymbolInfoDouble(_Symbol, SYMBOL_BID) : 
-                           SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-      double positionSL  = PositionGetDouble(POSITION_SL);
-      double positionTP  = PositionGetDouble(POSITION_TP);
+      double openPrice    = PositionGetDouble(POSITION_PRICE_OPEN);
+      double currentPrice = (type == POSITION_TYPE_BUY) ? 
+                            SymbolInfoDouble(_Symbol, SYMBOL_BID) : 
+                            SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+      double positionSL   = PositionGetDouble(POSITION_SL);
+      double positionTP   = PositionGetDouble(POSITION_TP);
 
       int trackerIdx = FindTrackerIndex(ticket);
       if(trackerIdx < 0) continue;
       
-      double risk = positionTracker[trackerIdx].risk;
-      bool breakevenSet = positionTracker[trackerIdx].breakevenSet;
+      double risk         = positionTracker[trackerIdx].risk;
+      bool   breakevenSet = positionTracker[trackerIdx].breakevenSet;
+      double zoneHigh     = positionTracker[trackerIdx].fvgUpper;
+      double zoneLow      = positionTracker[trackerIdx].fvgLower;
+
+      // Early invalidation by FVG
+      bool closeEarly = false;
+      if(lastClose > 0 && zoneHigh > 0 && zoneLow > 0)
+      {
+         if(type == POSITION_TYPE_BUY  && lastClose < zoneLow)  closeEarly = true;
+         if(type == POSITION_TYPE_SELL && lastClose > zoneHigh) closeEarly = true;
+      }
+      if(closeEarly)
+      {
+         if(trade.PositionClose(ticket))
+         {
+            PrintFormat("⚠️ Early exit (FVG invalidated) Ticket=%I64u", ticket);
+            RemoveFromTracker(ticket);
+         }
+         continue;
+      }
 
       double currentProfit = (type == POSITION_TYPE_BUY) ? 
                              (currentPrice - openPrice) : 
                              (openPrice - currentPrice);
-      
+
+      // Hard take at 2R (kept from your logic)
       if(currentProfit >= risk * 2.0)
       {
          if(trade.PositionClose(ticket))
          {
             PrintFormat("✅ CLOSED at 2R! Ticket=%I64u Profit=%.5f", ticket, currentProfit);
             RemoveFromTracker(ticket);
-            
             if(StopTradingAfterWin)
-            {
-               //StopTrading = true;
                Print("🏆 2R WIN - StopTrading activated");
-            }
          }
          continue;
       }
 
-      if(!breakevenSet && currentProfit >= risk)
+      // Enhanced breakeven: earliest of pips or ATR multiple; fallback to 1R
+      if(!breakevenSet)
       {
-         double newSL = openPrice;
-         if(trade.PositionModify(ticket, newSL, positionTP))
-         {
-            PrintFormat("⚖️ BREAKEVEN at 1R! Ticket=%I64u SL: %.5f->%.5f", 
-                        ticket, positionSL, newSL);
-            positionTracker[trackerIdx].breakevenSet = true;
-         }
-         continue;
-      }
+         double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+         double pipTrigger = (UseBreakevenPips && BreakevenTriggerPips > 0.0)
+                             ? BreakevenTriggerPips * point
+                             : 0.0;
+         double atrTrigger = (atrNow > 0.0 && BreakevenTriggerATRMult > 0.0)
+                             ? atrNow * BreakevenTriggerATRMult
+                             : 0.0;
 
-      // MODIFIED: Configurable stop on loss
-      if((type == POSITION_TYPE_BUY && currentPrice <= positionSL + SymbolInfoDouble(_Symbol, SYMBOL_POINT)*5) ||
-         (type == POSITION_TYPE_SELL && currentPrice >= positionSL - SymbolInfoDouble(_Symbol, SYMBOL_POINT)*5))
-      {
-         if(!breakevenSet && StopTradingAfterLoss) // Only stop if configured and we lost
-         {
-            Print("⛔ SL hit with loss. Stopping trading for the day.");
-            //StopTrading = true;
-         }
-         else if(!breakevenSet)
-         {
-            Print("⛔ SL hit with loss. Continuing (StopTradingAfterLoss=false).");
-         }
-         else
-         {
-            Print("⚖️ Breakeven SL hit. No loss. Continuing.");
-         }
-         continue;
-      }
+         double trigger = 0.0;
+         if(pipTrigger > 0.0 && atrTrigger > 0.0) trigger = MathMin(pipTrigger, atrTrigger);
+         else if(pipTrigger > 0.0)                trigger = pipTrigger;
+         else if(atrTrigger > 0.0)                trigger = atrTrigger;
+         else                                     trigger = risk; // fallback 1R
 
-      if(breakevenSet)
-      {
-         double atr = GetATR();
-         if(atr > 0)
+         if(currentProfit >= trigger)
          {
-            double desiredSL = (type == POSITION_TYPE_BUY) ? 
-                               (currentPrice - atr * TrailATRMult) : 
-                               (currentPrice + atr * TrailATRMult);
+            double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+            double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+            double spread   = MathMax(0.0, ask - bid);
+            double beBuffer = MathMax(point, spread); // cover costs
 
-            if((type == POSITION_TYPE_BUY && desiredSL > positionSL) ||
-               (type == POSITION_TYPE_SELL && desiredSL < positionSL))
+            double newSL = openPrice;
+            if(type == POSITION_TYPE_BUY)  newSL = openPrice + beBuffer;
+            if(type == POSITION_TYPE_SELL) newSL = openPrice - beBuffer;
+
+            if(trade.PositionModify(ticket, newSL, positionTP))
             {
-               if(trade.PositionModify(ticket, desiredSL, positionTP))
-                  PrintFormat("📈 TRAILING: %.5f->%.5f", positionSL, desiredSL);
+               PrintFormat("⚖️ Breakeven set (profit=%.5f >= trigger=%.5f). SL: %.5f->%.5f",
+                           currentProfit, trigger, positionSL, newSL);
+               positionTracker[trackerIdx].breakevenSet = true;
+               positionSL = newSL;
+               breakevenSet = true;
             }
+         }
+      }
+
+      // SL hit logs (unchanged)
+      double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+      if((type == POSITION_TYPE_BUY  && currentPrice <= positionSL + point*5) ||
+         (type == POSITION_TYPE_SELL && currentPrice >= positionSL - point*5))
+      {
+         if(!breakevenSet && StopTradingAfterLoss)
+            Print("⛔ SL hit with loss. Stopping trading for the day.");
+         else if(!breakevenSet)
+            Print("⛔ SL hit with loss. Continuing (StopTradingAfterLoss=false).");
+         else
+            Print("⚖️ Breakeven SL hit. No loss. Continuing.");
+         continue;
+      }
+
+      // Trailing after breakeven using ATR, gated by UseAtrTrailing
+      if(breakevenSet && UseAtrTrailing && atrNow > 0.0)
+      {
+         double mult = (TrailAtrMultiplier > 0.0) ? TrailAtrMultiplier : TrailATRMult; // prefer new, fallback old
+         double desiredSL = (type == POSITION_TYPE_BUY) ? 
+                            (currentPrice - atrNow * mult) : 
+                            (currentPrice + atrNow * mult);
+
+         bool shouldTighten = (type == POSITION_TYPE_BUY) ? (desiredSL > positionSL)
+                                                          : (desiredSL < positionSL);
+         if(shouldTighten)
+         {
+            if(trade.PositionModify(ticket, desiredSL, positionTP))
+               PrintFormat("📈 TRAILING: %.5f->%.5f", positionSL, desiredSL);
          }
       }
    }
 }
-
 //+------------------------------------------------------------------+
 //| Detect Range                                                      |
 //+------------------------------------------------------------------+
@@ -501,8 +629,9 @@ int DetectBreakout(double highRange, double lowRange)
 //+------------------------------------------------------------------+
 //| Detect FVG                                                        |
 //+------------------------------------------------------------------+
-bool DetectFVG(int &direction, double &zoneHigh, double &zoneLow)
+bool DetectFVG(int &direction, double &zoneHigh, double &zoneLow, datetime &zoneTime)
 {
+   zoneTime = 0;
    int totalBars = Bars(_Symbol, PERIOD_CURRENT);
    if(totalBars < 5) return false;
 
@@ -511,6 +640,9 @@ bool DetectFVG(int &direction, double &zoneHigh, double &zoneLow)
 
    for(int shift = 1; shift + 2 < totalBars; ++shift)
    {
+      datetime barTime = iTime(_Symbol, PERIOD_CURRENT, shift);
+      if(barTime == 0) continue;
+
       double newestLow = iLow(_Symbol, PERIOD_CURRENT, shift);
       double newestHigh = iHigh(_Symbol, PERIOD_CURRENT, shift);
       double oldestHigh = iHigh(_Symbol, PERIOD_CURRENT, shift + 2);
@@ -521,6 +653,7 @@ bool DetectFVG(int &direction, double &zoneHigh, double &zoneLow)
          direction = 1;
          zoneLow = oldestHigh;
          zoneHigh = newestLow;
+         zoneTime = barTime;
          return true;
       }
 
@@ -529,7 +662,8 @@ bool DetectFVG(int &direction, double &zoneHigh, double &zoneLow)
          direction = -1;
          zoneHigh = oldestLow;
          zoneLow = newestHigh;
-         return true;
+         zoneTime = barTime;
+         return true;  
       }
    }
    return false;
@@ -545,46 +679,59 @@ void PlaceMarketTrade(int direction, double highRange, double lowRange, double a
    Print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
    Print("💼 PLACING TRADE");
 
-   double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
-   int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
-   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-   double entry = (direction == 1) ? ask : bid;
+   double point  = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   int    digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+   double ask    = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double bid    = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double entry  = (direction == 1) ? ask : bid;
 
    PrintFormat("  %s | Entry: %.5f | ATR: %.5f", 
                direction == 1 ? "BUY" : "SELL", entry, atr);
 
-   double structureSL;
-   if(direction == 1)
-      structureSL = lowRange - SLBufferPoints * point;
-   else
-      structureSL = highRange + SLBufferPoints * point;
+   // Structure SL (with small buffer)
+   double structureSL = (direction == 1)
+                        ? (lowRange  - SLBufferPoints * point)
+                        : (highRange + SLBufferPoints * point);
 
-   double minSLDistance = atr * MinATRMultiplier;
    double structureDistance = MathAbs(entry - structureSL);
-   
-   double sl;
-   if(structureDistance < minSLDistance)
+
+   // Recent FVG cap (optional)
+   double avgFvgHeight = ComputeRecentFvgMean();
+   double fvgCap = (avgFvgHeight > 0.0) ? (avgFvgHeight * 1.5) : 0.0;
+
+   // ATR floor for SL
+   double atrFloor = 0.0;
+   if(atr > 0)
    {
-      if(direction == 1)
-         sl = entry - minSLDistance;
-      else
-         sl = entry + minSLDistance;
-      
-      PrintFormat("  ⚠️ SL extended: %.5f->%.5f (ATR min)", structureDistance, minSLDistance);
-   }
-   else
-   {
-      sl = structureSL;
-      PrintFormat("  ✓ Structure SL: %.5f", structureDistance);
+      double mult = UseDynamicAtrStops ? DynamicSlAtrMult : ATRMultiplierSL;
+      atrFloor = MathMax(0.0, mult) * atr;
    }
 
+   // Combine: respect structure (capped by FVG), but never tighter than ATR floor; obey minimum distance
+   double slDistance = structureDistance;
+   if(fvgCap > 0.0)
+      slDistance = MathMin(slDistance, fvgCap);
+
+   slDistance = MathMax(slDistance, atrFloor);
+   slDistance = MathMax(slDistance, MinimumSlDistancePoints * point);
+
+   double sl = (direction == 1) ? (entry - slDistance) : (entry + slDistance);
    double risk = MathAbs(entry - sl);
-   double tp = (direction == 1) ? (entry + risk * RR) : (entry - risk * RR);
 
-   double slDistancePoints = MathAbs(entry - sl) / point;
-   PrintFormat("  SL: %.5f (%.1f pts) | TP: %.5f (%.1f:1)", 
-               sl, slDistancePoints, tp, RR);
+   // Dynamic TP: use ATR-based distance when enabled; otherwise RR
+   double tpDistance;
+   if(UseDynamicAtrStops && atr > 0.0)
+      tpDistance = MathMax(point, DynamicTpAtrMult * atr);
+   else
+      tpDistance = MathMax(point, risk * RR);
+
+   double tp = (direction == 1) ? (entry + tpDistance) : (entry - tpDistance);
+
+   double slDistancePoints = slDistance / point;
+   double tpRMultiple = (risk > 0.0) ? (tpDistance / risk) : 0.0;
+
+   PrintFormat("  SL: %.5f (%.1f pts) | TP: %.5f (%.2fR)", 
+               sl, slDistancePoints, tp, tpRMultiple);
 
    if(slDistancePoints < MinimumSlDistancePoints)
    {
@@ -596,14 +743,14 @@ void PlaceMarketTrade(int direction, double highRange, double lowRange, double a
    double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
    double maxLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
    double step   = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
-   
+
    if(minLot <= 0) minLot = 0.01;
    if(maxLot <= 0) maxLot = 100.0;
    if(lots < minLot) lots = minLot;
    if(lots > maxLot) lots = maxLot;
    if(step > 0) lots = MathFloor(lots / step) * step;
    lots = NormalizeDouble(lots, 2);
-   
+
    PrintFormat("  Lots: %.2f", lots);
 
    if(sl <= 0 || tp <= 0)
@@ -613,14 +760,13 @@ void PlaceMarketTrade(int direction, double highRange, double lowRange, double a
    }
 
    trade.SetExpertMagicNumber(MagicNumber);
-   trade.SetDeviationInPoints(50); // Allow 50 points slippage
-   trade.SetTypeFilling(ORDER_FILLING_FOK); // Fill or Kill
-   trade.SetAsyncMode(false); // Synchronous execution
+   trade.SetDeviationInPoints(50);
+   trade.SetTypeFilling(ORDER_FILLING_FOK);
+   trade.SetAsyncMode(false);
    
    bool ok = false;
    string comment = (direction == 1) ? "Buy FVG" : "Sell FVG";
 
-   // MODIFIED: Use current price explicitly for market execution
    if(direction == 1)
       ok = trade.Buy(lots, _Symbol, ask, sl, tp, comment);
    else
@@ -634,11 +780,11 @@ void PlaceMarketTrade(int direction, double highRange, double lowRange, double a
    }
    else
    {
-      ulong ticket = trade.ResultDeal(); // Use ResultDeal for market orders
-      if(ticket == 0) ticket = trade.ResultOrder(); // Fallback
+      ulong ticket = trade.ResultDeal();
+      if(ticket == 0) ticket = trade.ResultOrder();
       PrintFormat("✅ OPENED! Ticket=%I64u Deal=%I64u", ticket, trade.ResultDeal());
       
-      // MODIFIED: Get actual ticket from position
+      // Track the actual position
       int total = PositionsTotal();
       for(int i = total - 1; i >= 0; i--)
       {
@@ -650,9 +796,9 @@ void PlaceMarketTrade(int direction, double highRange, double lowRange, double a
                FindTrackerIndex(posTicket) < 0)
             {
                double actualEntry = PositionGetDouble(POSITION_PRICE_OPEN);
-               double actualSL = PositionGetDouble(POSITION_SL);
-               double actualRisk = MathAbs(actualEntry - actualSL);
-               AddToTracker(posTicket, actualEntry, actualSL, actualRisk);
+               double actualSL    = PositionGetDouble(POSITION_SL);
+               double actualRisk  = MathAbs(actualEntry - actualSL);
+               AddToTracker(posTicket, actualEntry, actualSL, actualRisk, fvgHigh, fvgLow);
                PrintFormat("   Position tracked: Ticket=%I64u", posTicket);
                break;
             }
@@ -661,7 +807,6 @@ void PlaceMarketTrade(int direction, double highRange, double lowRange, double a
    }
    Print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 }
-
 //+------------------------------------------------------------------+
 //| Calculate lot size                                                |
 //+------------------------------------------------------------------+
@@ -721,7 +866,7 @@ int CountPositionsForSymbolAndMagic(string symbol, int magic)
 //+------------------------------------------------------------------+
 //| Position tracker functions                                        |
 //+------------------------------------------------------------------+
-void AddToTracker(ulong ticket, double entry, double sl, double risk)
+void AddToTracker(ulong ticket, double entry, double sl, double risk, double zoneHigh = 0.0, double zoneLow = 0.0)
 {
    int size = ArraySize(positionTracker);
    ArrayResize(positionTracker, size + 1);
@@ -730,6 +875,9 @@ void AddToTracker(ulong ticket, double entry, double sl, double risk)
    positionTracker[size].originalSL = sl;
    positionTracker[size].risk = risk;
    positionTracker[size].breakevenSet = false;
+   positionTracker[size].fvgUpper = zoneHigh;
+   positionTracker[size].fvgLower = zoneLow;
+   positionTracker[size].partialClosed = false;
    
    if(EnableDebugPrints)
       PrintFormat("📝 Tracked: %I64u Entry=%.5f Risk=%.5f", ticket, entry, risk);
@@ -989,4 +1137,179 @@ void ClosePositionsForSymbolAndMagic(string symbol, int magic, const string reas
       PrintFormat("ℹ️ Closed %d position(s) because of %s. Current bias=%s", closed, reason, MarketBias);
    }
 }
-//+------------------------------------------------------------------+
+
+bool IsWithinNewYorkSession()
+{
+   datetime now = TimeCurrent();
+   if(now == 0)
+      return false;
+
+   MqlDateTime dt;
+   TimeToStruct(now, dt);
+
+   bool afterStart = (dt.hour > NYSessionStartHour) ||
+                     (dt.hour == NYSessionStartHour && dt.min >= NYSessionStartMinute);
+
+   bool beforeEnd = (dt.hour < NYSessionEndHour) ||
+                    (dt.hour == NYSessionEndHour && dt.min <= NYSessionEndMinute);
+
+   if(NYSessionStartHour <= NYSessionEndHour)
+      return afterStart && beforeEnd;
+
+   return afterStart || beforeEnd; // handles overnight windows
+}
+
+void RecordFvgHeight(double height)
+{
+   if(height <= 0.0)
+      return;
+
+   int size = ArraySize(recentFvgHeights);
+   if(size >= MAX_FVG_HISTORY)
+   {
+      for(int i = 1; i < size; ++i)
+         recentFvgHeights[i - 1] = recentFvgHeights[i];
+      recentFvgHeights[size - 1] = height;
+   }
+   else
+   {
+      ArrayResize(recentFvgHeights, size + 1);
+      recentFvgHeights[size] = height;
+   }
+}
+
+double ComputeRecentFvgMean()
+{
+   int size = ArraySize(recentFvgHeights);
+   if(size == 0)
+      return 0.0;
+
+   double sum = 0.0;
+   for(int i = 0; i < size; ++i)
+      sum += recentFvgHeights[i];
+
+   return sum / size;
+}
+
+string TrimString(const string text)
+{
+   string tmp = text;
+   StringTrimLeft(tmp);
+   StringTrimRight(tmp);
+   return tmp;
+}
+
+bool ParseTimeString(const string text, int &hour, int &minute)
+{
+   string trimmed = TrimString(text);
+   string parts[];
+   if(StringSplit(trimmed, ':', parts) != 2)
+      return false;
+
+   hour   = (int)StringToInteger(parts[0]);
+   minute = (int)StringToInteger(parts[1]);
+   return (hour >= 0 && hour < 24 && minute >= 0 && minute < 60);
+}
+
+bool PassesTrendSlope()
+{
+   if(!UseTrendFilter || maHandle == INVALID_HANDLE)
+      return true;
+
+   double values[2];
+   if(CopyBuffer(maHandle, 0, 0, 2, values) != 2)
+      return true;
+
+   double point       = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   double slopePoints = (point > 0.0) ? (values[0] - values[1]) / point : (values[0] - values[1]);
+
+   if(fvgDirection == 1)
+      return slopePoints >= TrendSlopeMinPoints;
+   if(fvgDirection == -1)
+      return slopePoints <= -TrendSlopeMinPoints;
+
+   return true;
+}
+
+bool PassesAdxState()
+{
+   if(!EnableAdxMarketFilter || adxHandle == INVALID_HANDLE)
+      return true;
+
+   double val[1];
+   if(CopyBuffer(adxHandle, 0, 1, 1, val) != 1)
+      return true;
+
+   return val[0] >= AdxTrendingThreshold;
+}
+
+bool InNewsBlackout()
+{
+   if(!UseNewsBlackout || StringLen(NewsBlackoutWindows) == 0)
+      return false;
+
+   datetime now   = TimeCurrent();
+   string   today = TimeToString(now, TIME_DATE);
+
+   string segments[];
+   int total = StringSplit(NewsBlackoutWindows, ';', segments);
+   for(int i = 0; i < total; ++i)
+   {
+      string window = TrimString(segments[i]);
+      if(StringLen(window) == 0)
+         continue;
+
+      string times[2];
+      if(StringSplit(window, '-', times) != 2)
+         continue;
+
+      int startHour, startMinute, endHour, endMinute;
+      if(!ParseTimeString(times[0], startHour, startMinute))
+         continue;
+      if(!ParseTimeString(times[1], endHour, endMinute))
+         continue;
+
+      datetime startTime = StringToTime(StringFormat("%s %02d:%02d", today, startHour, startMinute));
+      datetime endTime   = StringToTime(StringFormat("%s %02d:%02d", today, endHour, endMinute));
+      if(startTime == 0 || endTime == 0)
+         continue;
+
+      if(endTime < startTime)
+         endTime += 24 * 60 * 60;
+
+      datetime checkTime = now;
+      if(checkTime < startTime)
+         checkTime += 24 * 60 * 60;
+
+      if(checkTime >= startTime && checkTime <= endTime)
+         return true;
+   }
+   return false;
+}
+
+int CountDirectionalTrades(int direction)
+{
+   if(direction == 0)
+      return 0;
+
+   int count = 0;
+   int total = PositionsTotal();
+   for(int i = 0; i < total; ++i)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(!PositionSelectByTicket(ticket))
+         continue;
+
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol)
+         continue;
+      if((int)PositionGetInteger(POSITION_MAGIC) != MagicNumber)
+         continue;
+
+      int type = (int)PositionGetInteger(POSITION_TYPE);
+      if(direction == 1 && type == POSITION_TYPE_BUY)
+         count++;
+      if(direction == -1 && type == POSITION_TYPE_SELL)
+         count++;
+   }
+   return count;
+}
