@@ -49,14 +49,6 @@ double fvgLow  = 0.0;
 int    fvgDirection = 0;
 int    tickCounter = 0;
 
-// Add session bootstrap state
-datetime SessionStartTime = 0;
-datetime lastFVGAnchorTime = 0;
-datetime lastFVGUsedTime   = 0;
-bool     haveSessionRange  = false;
-double   sessionRangeHigh  = 0.0;
-double   sessionRangeLow   = 0.0;
-
 struct PositionInfo
 {
    ulong    ticket;
@@ -108,15 +100,6 @@ int OnInit()
    Print("========================================");
    
    ArrayResize(positionTracker, 0);
-
-   // Initialize session start
-   SessionStartTime = 0;
-   lastFVGAnchorTime = 0;
-   lastFVGUsedTime = 0;
-   haveSessionRange = false;
-   sessionRangeHigh = 0.0;
-   sessionRangeLow  = 0.0;
-
    return INIT_SUCCEEDED;
 }
 
@@ -189,66 +172,28 @@ void OnTick()
          Print("❌ ATR unavailable");
       return;
    }
-
-   // Ensure we have a session start time (today 00:00)
-   if(SessionStartTime == 0)
+   
+   if(atr > MaxATRToTrade)
    {
-      MqlDateTime d; TimeToStruct(TimeCurrent(), d);
-      d.hour = 0; d.min = 0; d.sec = 0;
-      SessionStartTime = StructToTime(d);
+      if(EnableDebugPrints && tickCounter % (DebugPrintInterval*5) == 0)
+         PrintFormat("❌ ATR: %.5f > %.5f", atr, MaxATRToTrade);
+      return;
    }
 
-   // Range detection with intraday fallback
    double highRange, lowRange;
    bool rangeDetected = DetectRange(MinBarsInRange, highRange, lowRange);
-
+   
    if(!rangeDetected)
    {
-      // Try to find a recent valid range earlier in today's session
-      if(!haveSessionRange)
-      {
-         if(FindRecentRangeInSession(MinBarsInRange, sessionRangeHigh, sessionRangeLow))
-         {
-            haveSessionRange = true;
-            if(EnableDebugPrints && tickCounter % (DebugPrintInterval*2) == 0)
-               PrintFormat("📏 Using session range (fallback): H=%.5f L=%.5f", sessionRangeHigh, sessionRangeLow);
-         }
-      }
-
-      if(haveSessionRange)
-      {
-         highRange = sessionRangeHigh;
-         lowRange  = sessionRangeLow;
-      }
-      else
-      {
-         if(EnableDebugPrints && tickCounter % (DebugPrintInterval*2) == 0)
-            Print("⏸ No range found yet today");
-         return;
-      }
-   }
-   else
-   {
-      // Cache the latest detected range as session fallback
-      sessionRangeHigh = highRange;
-      sessionRangeLow  = lowRange;
-      haveSessionRange = true;
+      if(EnableDebugPrints && tickCounter % (DebugPrintInterval*2) == 0)
+         Print("⏸ No range");
+      return;
    }
 
-   // Breakout detection with intraday fallback (if alignment is required)
    int breakout = DetectBreakout(highRange, lowRange);
-   if(breakout == 0 && RequireBreakoutFVGAlign)
-   {
-      breakout = ScanRecentBreakoutInSession(highRange, lowRange);
-      if(EnableDebugPrints && breakout != 0)
-         PrintFormat("🚀 SESSION BREAKOUT (historical): %s", breakout == 1 ? "BULLISH" : "BEARISH");
-   }
-   else if(EnableDebugPrints && breakout != 0)
-   {
+   if(EnableDebugPrints && breakout != 0)
       PrintFormat("🚀 BREAKOUT: %s", breakout == 1 ? "BULLISH" : "BEARISH");
-   }
 
-   // Try live FVG first
    int dir; 
    double zHigh, zLow;
    if(DetectFVG(dir, zHigh, zLow))
@@ -256,7 +201,7 @@ void OnTick()
       if(EnableDebugPrints)
          PrintFormat("🎯 FVG: %s [%.5f-%.5f]", 
                      dir == 1 ? "BULLISH" : "BEARISH", zLow, zHigh);
-
+      
       if(RequireBreakoutFVGAlign)
       {
          if(breakout != 0 && breakout == dir)
@@ -264,7 +209,6 @@ void OnTick()
             fvgDirection = dir;
             fvgHigh = zHigh;
             fvgLow  = zLow;
-            lastFVGAnchorTime = iTime(_Symbol, PERIOD_CURRENT, 1); // anchor on bar[1]
             if(EnableDebugPrints)
                Print("✓ FVG ALIGNED");
          }
@@ -278,17 +222,12 @@ void OnTick()
          fvgDirection = dir;
          fvgHigh = zHigh;
          fvgLow  = zLow;
-         lastFVGAnchorTime = iTime(_Symbol, PERIOD_CURRENT, 1);
       }
    }
 
-   // If no current FVG, seed from earlier in today's session
-   if(fvgDirection == 0)
-      TrySeedSessionFVG();
-
    if(fvgDirection != 0)
    {
-      double price = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+      double price = bid;
       double fvgHeight = MathAbs(fvgHigh - fvgLow);
       double tolerance = fvgHeight * RetraceTolerancePct;
 
@@ -326,7 +265,7 @@ void OnTick()
          }
          else if(momentum)
          {
-          if(EnableDebugPrints)
+            if(EnableDebugPrints)
                PrintFormat("🔴 MOMENTUM: %.5f < %.5f", price, fvgLow);
             PlaceMarketTrade(-1, highRange, lowRange, atr);
             fvgDirection = 0;
@@ -360,18 +299,6 @@ void UpdateEquityPeakAndDaily()
       LastTradeDay = dt.day;
       DailyStartEquity = equity;
       StopTrading = false;
-
-      // Reset session bootstrap on new day
-      SessionStartTime = 0;
-      haveSessionRange = false;
-      sessionRangeHigh = 0.0;
-      sessionRangeLow  = 0.0;
-      fvgDirection = 0;
-      fvgHigh = 0.0;
-      fvgLow  = 0.0;
-      lastFVGAnchorTime = 0;
-      lastFVGUsedTime   = 0;
-
       PrintFormat("📅 NEW DAY: Equity=%.2f | StopTrading RESET", DailyStartEquity);
    }
 
@@ -532,27 +459,6 @@ int DetectBreakout(double highRange, double lowRange)
    return 0;
 }
 
-// NEW: scan earlier bars of the current day for a breakout
-int ScanRecentBreakoutInSession(double highRange, double lowRange)
-{
-   int total = Bars(_Symbol, PERIOD_CURRENT);
-   if(total < 3) return 0;
-
-   MqlDateTime d; TimeToStruct(TimeCurrent(), d);
-   d.hour = 0; d.min = 0; d.sec = 0;
-   datetime start = StructToTime(d);
-
-   for(int k = 1; k < total; k++)
-   {
-      datetime t = iTime(_Symbol, PERIOD_CURRENT, k);
-      if(t < start) break;
-      double c = iClose(_Symbol, PERIOD_CURRENT, k);
-      if(c > highRange) return 1;
-      if(c < lowRange) return -1;
-   }
-   return 0;
-}
-
 //+------------------------------------------------------------------+
 //| Detect FVG                                                        |
 //+------------------------------------------------------------------+
@@ -693,7 +599,7 @@ void PlaceMarketTrade(int direction, double highRange, double lowRange, double a
       if(ticket == 0) ticket = trade.ResultOrder(); // Fallback
       PrintFormat("✅ OPENED! Ticket=%I64u Deal=%I64u", ticket, trade.ResultDeal());
       
-      // Track the actual opened position
+      // MODIFIED: Get actual ticket from position
       int total = PositionsTotal();
       for(int i = total - 1; i >= 0; i--)
       {
@@ -713,10 +619,6 @@ void PlaceMarketTrade(int direction, double highRange, double lowRange, double a
             }
          }
       }
-
-      // Mark this FVG as used so we don't reuse the same zone repeatedly
-      if(lastFVGAnchorTime != 0)
-         lastFVGUsedTime = lastFVGAnchorTime;
    }
    Print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 }
@@ -849,137 +751,5 @@ void SyncPositionTracker()
          AddToTracker(ticket, entry, sl, risk);
       }
    }
-}
-
-//+------------------------------------------------------------------+
-//| NEW: Seed FVG from earlier bars of the current day (most recent valid one)
-//+------------------------------------------------------------------+
-void TrySeedSessionFVG()
-{
-   int dir; double zh, zl; datetime anchor;
-   if(ScanMostRecentFVGForDay(PERIOD_CURRENT, dir, zh, zl, anchor))
-   {
-      if(anchor != 0 && anchor != lastFVGUsedTime)
-      {
-         // If alignment is required, ensure today's breakout matches
-         if(!RequireBreakoutFVGAlign)
-         {
-            fvgDirection = dir; fvgHigh = zh; fvgLow = zl; lastFVGAnchorTime = anchor;
-            if(EnableDebugPrints)
-               PrintFormat("📚 Seeded FVG from earlier today: %s [%.5f-%.5f] at %s",
-                           dir == 1 ? "BULLISH" : "BEARISH",
-                           zl, zh, TimeToString(anchor, TIME_DATE|TIME_MINUTES));
-         }
-         else
-         {
-            // Use cached or recent session range to test breakout alignment
-            double hr = haveSessionRange ? sessionRangeHigh : 0.0;
-            double lr = haveSessionRange ? sessionRangeLow  : 0.0;
-            if(!haveSessionRange && FindRecentRangeInSession(MinBarsInRange, hr, lr))
-            {
-               sessionRangeHigh = hr; sessionRangeLow = lr; haveSessionRange = true;
-            }
-            int br = (haveSessionRange ? ScanRecentBreakoutInSession(hr, lr) : 0);
-            if(br != 0 && br == dir)
-            {
-               fvgDirection = dir; fvgHigh = zh; fvgLow = zl; lastFVGAnchorTime = anchor;
-               if(EnableDebugPrints)
-                  PrintFormat("📚 Seeded ALIGNED FVG from earlier today: %s [%.5f-%.5f] at %s",
-                              dir == 1 ? "BULLISH" : "BEARISH",
-                              zl, zh, TimeToString(anchor, TIME_DATE|TIME_MINUTES));
-            }
-         }
-      }
-   }
-}
-
-//+------------------------------------------------------------------+
-//| NEW: Find most recent FVG in today's session                     |
-//+------------------------------------------------------------------+
-bool ScanMostRecentFVGForDay(ENUM_TIMEFRAMES tf, int &direction, double &zoneHigh, double &zoneLow, datetime &anchorTime)
-{
-   direction = 0; zoneHigh = 0.0; zoneLow = 0.0; anchorTime = 0;
-
-   int total = Bars(_Symbol, tf);
-   if(total < 4) return false;
-
-   MqlDateTime d; TimeToStruct(TimeCurrent(), d);
-   d.hour = 0; d.min = 0; d.sec = 0;
-   datetime start = StructToTime(d);
-
-   // k=1 is the most recent closed bar; we check pair (k+1, k)
-   for(int k = 1; k + 1 < total; k++)
-   {
-      datetime t = iTime(_Symbol, tf, k);
-      if(t < start) break;
-
-      double high2 = iHigh(_Symbol, tf, k + 1);
-      double low2  = iLow (_Symbol, tf, k + 1);
-      double high1 = iHigh(_Symbol, tf, k);
-      double low1  = iLow (_Symbol, tf, k);
-
-      double overlapTolerance = 0.3;
-
-      double bullishGap = low1 - high2;
-      double bar2Range  = high2 - low2;
-      if(bar2Range > 0 && bullishGap >= -bar2Range * overlapTolerance)
-      {
-         direction = 1;
-         zoneHigh = low1;
-         zoneLow  = high2;
-         anchorTime = t; // bar k time
-         return true;
-      }
-
-      double bearishGap = low2 - high1;
-      double bar1Range  = high1 - low1;
-      if(bar1Range > 0 && bearishGap >= -bar1Range * overlapTolerance)
-      {
-         direction = -1;
-         zoneHigh = low2;
-         zoneLow  = high1;
-         anchorTime = t; // bar k time
-         return true;
-      }
-   }
-   return false;
-}
-
-//+------------------------------------------------------------------+
-//| NEW: find a recent narrow range window inside today's session    |
-//+------------------------------------------------------------------+
-bool FindRecentRangeInSession(int window, double &highRange, double &lowRange)
-{
-   int total = Bars(_Symbol, PERIOD_CURRENT);
-   if(window <= 1) window = 2;
-   if(total < window + 2) return false;
-
-   MqlDateTime d; TimeToStruct(TimeCurrent(), d);
-   d.hour = 0; d.min = 0; d.sec = 0;
-   datetime start = StructToTime(d);
-
-   // s=1 is the most recent closed bar as window start
-   for(int s = 1; s + window - 1 < total; s++)
-   {
-      datetime oldest = iTime(_Symbol, PERIOD_CURRENT, s + window - 1);
-      if(oldest < start) break;
-
-      int idxHigh = iHighest(_Symbol, PERIOD_CURRENT, MODE_HIGH, window, s);
-      int idxLow  = iLowest (_Symbol, PERIOD_CURRENT, MODE_LOW , window, s);
-      double h = iHigh(_Symbol, PERIOD_CURRENT, idxHigh);
-      double l = iLow (_Symbol, PERIOD_CURRENT, idxLow );
-
-      double mid = (h + l) / 2.0;
-      if(mid <= 0) continue;
-
-      double widthPct = (h - l) / mid;
-      if(widthPct <= MaxRangePct)
-      {
-         highRange = h;
-         lowRange  = l;
-         return true;
-      }
-   }
-   return false;
 }
 //+------------------------------------------------------------------+
