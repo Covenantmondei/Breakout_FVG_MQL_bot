@@ -62,11 +62,30 @@ input bool     UseAtrTrailing           = true;
 input double   TrailAtrMultiplier       = 0.75;
 input bool     EnablePartialClose       = true;
 input double   PartialCloseFraction     = 0.5;
+input int      CooldownMinutes          = 30;
+input int      LookbackBars             = 200;
+input ENUM_TIMEFRAMES TrendTF           = PERIOD_H1;
+input double   MinATR                   = 0.50; 
 
 // ------------------------ Globals ------------------
+int tradesToday = 0;
+datetime lastTradeTime = 0;
+int lastResetDay = -1;
+datetime lastFVGTime = 0;
+datetime lastProcessedFvgTime = 0;
+bool     historicalSignalPending  = false;
+bool     historicalSignalConsumed = false;
+int      historicalSignalDir      = 0;
+double   historicalRangeHigh      = 0.0;
+double   historicalRangeLow       = 0.0;
+double   historicalFvgHigh        = 0.0;
+double   historicalFvgLow         = 0.0;
+datetime historicalSignalTime     = 0;
 int atrHandle = INVALID_HANDLE;
 int maHandle = INVALID_HANDLE;
 int adxHandle = INVALID_HANDLE;
+int trend200Handle = INVALID_HANDLE;
+int atrVolHandle   = INVALID_HANDLE;
 double equity = 0.0;
 double EquityPeak = 0.0;
 bool StopTrading = false;
@@ -78,6 +97,8 @@ int    fvgDirection = 0;
 int    tickCounter = 0;
 double recentFvgHeights[];
 const int MAX_FVG_HISTORY = 10;
+bool TrendFilterAllows(int direction);
+double GetVolatilityAtr();
 
 
 //-------------------License Code Start----------------------//
@@ -118,7 +139,6 @@ datetime lastSwingHighTime = 0;
 datetime lastSwingLowTime = 0;
 datetime lastBreakoutTime = 0;
 datetime lastContextBarTime = 0;
-datetime lastFVGTime = 0;
 
 const int NYSessionStartHour   = 13;
 const int NYSessionStartMinute = 0;
@@ -131,34 +151,40 @@ void ClosePositionsForSymbolAndMagic(string symbol, int magic, const string reas
 bool IsWithinNewYorkSession();
 void RecordFvgHeight(double height);
 double ComputeRecentFvgMean();
+void InitializeHistoricalSignal();  
+bool ScanHistoricalSignal(int lookbackBars, int &direction, double &rangeHigh, double &rangeLow, double &zoneHigh, double &zoneLow, datetime &signalTime);
+bool DetectFVGAtShift(int shift, int &direction, double &zoneHigh, double &zoneLow, datetime &zoneTime);
+bool GetRangeAtShift(int shift, int barsBack, double &highRange, double &lowRange);
+bool IsHistoricalSignalStillValid(int direction, double rangeHigh, double rangeLow, double zoneHigh, double zoneLow);
+bool TryExecuteHistoricalSignal(double atr); 
 
 //+------------------------------------------------------------------+
 //| Expert initialization                                            |
 //+------------------------------------------------------------------+
 int OnInit()
 {
-   auth = false;
+   // auth = false;
 
-   LicenseKeyActive = licensekey;
-   StringTrimLeft(LicenseKeyActive);
-   StringTrimRight(LicenseKeyActive);
+   // LicenseKeyActive = licensekey;
+   // StringTrimLeft(LicenseKeyActive);
+   // StringTrimRight(LicenseKeyActive);
 
-   if(StringLen(LicenseKeyActive) == 0)
-   {
-      Print("License key missing. Please enter your license.");
-      return INIT_FAILED;
-   }
+   // if(StringLen(LicenseKeyActive) == 0)
+   // {
+   //    Print("License key missing. Please enter your license.");
+   //    return INIT_FAILED;
+   // }
 
-   if(!Validate(LicenseKeyActive))
-   {
-      Print("License validation failed. Check your key or WebRequest permissions.");
-      return INIT_FAILED;
-   }
+   // if(!Validate(LicenseKeyActive))
+   // {
+   //    Print("License validation failed. Check your key or WebRequest permissions.");
+   //    return INIT_FAILED;
+   // }
 
    // updateConnectionStatus(LicenseKeyActive);
    // updateConnectionStatusConnected(LicenseKeyActive);
    // updateHardwareId(LicenseKeyActive);
-   auth = true;
+   // auth = true;
 
 
    Print("========================================");
@@ -168,16 +194,20 @@ int OnInit()
    atrHandle = iATR(_Symbol, ATRTimeframe, ATRPeriod);
    maHandle = iMA(_Symbol, TrendMATimeframe, TrendMAPeriod, 0, MODE_EMA, PRICE_CLOSE);
    adxHandle = iADX(_Symbol, PERIOD_CURRENT, AdxPeriod);
+   trend200Handle = iMA(_Symbol, TrendTF, 200, 0, MODE_EMA, PRICE_CLOSE);
+   atrVolHandle   = iATR(_Symbol, PERIOD_CURRENT, 14); 
    if(UseTrendFilter && maHandle == INVALID_HANDLE)
       return INIT_FAILED;
    if(EnableAdxMarketFilter && adxHandle == INVALID_HANDLE)
+      return INIT_FAILED;
+   if(trend200Handle == INVALID_HANDLE || atrVolHandle == INVALID_HANDLE)
       return INIT_FAILED;
    Print("ATR, MA, and ADX Handles created successfully");
 
    equity = AccountInfoDouble(ACCOUNT_EQUITY);
    EquityPeak = equity;
    DailyStartEquity = equity;
-   datetime t = TimeGMT();
+   datetime t = TimeCurrent();
    MqlDateTime dt; TimeToStruct(t, dt);
    LastTradeDay = dt.day;
    StopTrading = false;
@@ -216,6 +246,8 @@ int OnInit()
       else
          Print("No qualifying FVG found within initialization window.");
    }
+   InitializeHistoricalSignal(); 
+
    return INIT_SUCCEEDED;
 }
 
@@ -232,6 +264,8 @@ void OnDeinit(const int reason)
       IndicatorRelease(atrHandle);
       atrHandle = INVALID_HANDLE;
    }
+   if(trend200Handle != INVALID_HANDLE) { IndicatorRelease(trend200Handle); trend200Handle = INVALID_HANDLE; }
+   if(atrVolHandle != INVALID_HANDLE)   { IndicatorRelease(atrVolHandle);   atrVolHandle   = INVALID_HANDLE; }
    Print("EA deinitialized. Reason: ", reason);
 }
 
@@ -240,10 +274,21 @@ void OnDeinit(const int reason)
 //+------------------------------------------------------------------+
 void OnTick()
 {
-   if(!auth)
-      return;
+   // if(!auth)
+   //    return;
 
    tickCounter++;
+   MqlDateTime t;
+
+   datetime now = TimeCurrent();
+   TimeToStruct(now, t);
+   int currentDay = t.day;
+
+   if(currentDay != lastResetDay)
+   {
+      tradesToday = 0;
+      lastResetDay = currentDay;
+   }
 
    bool breakoutChanged = false;
    if(UpdateMarketContext(false, breakoutChanged) && breakoutChanged)
@@ -307,99 +352,127 @@ void OnTick()
          PrintFormat("❌ ATR: %.5f > %.5f", atr, MaxATRToTrade);
       return;
    }
-
-   double highRange, lowRange;
-   bool rangeDetected = DetectRange(MinBarsInRange, highRange, lowRange);
-   
-   if(!rangeDetected)
+   if(tradesToday >= 3)
    {
-      if(EnableDebugPrints && tickCounter % (DebugPrintInterval*2) == 0)
-         Print("⏸ No range");
+      if(EnableDebugPrints && tickCounter % DebugPrintInterval == 0)
+         Print("📉 Max trades reached today");
       return;
    }
 
-   int breakout = DetectBreakout(highRange, lowRange);
-   if(EnableDebugPrints && breakout != 0)
-      PrintFormat("🚀 BREAKOUT: %s", breakout == 1 ? "BULLISH" : "BEARISH");
-
-   int dir; 
-   double zHigh, zLow;
-   datetime detectedTime = 0;
-   if(DetectFVG(dir, zHigh, zLow, detectedTime))
+   if((now - lastTradeTime) < CooldownMinutes * 60)
    {
-      bool isNewFvg = (detectedTime != lastFVGTime);
-
-      if(isNewFvg)
-      {
-         if(EnableDebugPrints)
-            PrintFormat("🎯 FVG: %s [%.5f-%.5f] @ %s",
-                        dir == 1 ? "BULLISH" : "BEARISH",
-                        zLow, zHigh,
-                        TimeToString(detectedTime, TIME_DATE|TIME_MINUTES));
-
-         fvgDirection = dir;
-         fvgHigh      = zHigh;
-         fvgLow       = zLow;
-         lastFVGTime  = detectedTime;
-         RecordFvgHeight(MathAbs(zHigh - zLow));
-      }
+      if(EnableDebugPrints && tickCounter % DebugPrintInterval == 0)
+         Print("Cooling down - waiting before next trade");
+      return;
    }
 
-   if(fvgDirection != 0)
+   double highRange, lowRange;
+   bool rangeDetected = DetectRange(MinBarsInRange, highRange, lowRange);
+
+   if(!rangeDetected)
    {
-      if(RequireBreakoutFVGAlign && LastBreakoutDir != 0 && fvgDirection != LastBreakoutDir)
+      int fallbackBars = MathMax(MinBarsInRange, 4);
+      int idxHigh = iHighest(_Symbol, PERIOD_CURRENT, MODE_HIGH, fallbackBars, 1);
+      int idxLow  = iLowest (_Symbol, PERIOD_CURRENT, MODE_LOW, fallbackBars, 1);
+      highRange = iHigh(_Symbol, PERIOD_CURRENT, idxHigh);
+      lowRange  = iLow (_Symbol, PERIOD_CURRENT, idxLow);
+
+      if(EnableDebugPrints && tickCounter % (DebugPrintInterval*2) == 0)
+         Print("⏸ No tight range; using fallback envelope.");
+   }
+   // fresh breakout result (no globals)
+   int breakoutDir = DetectBreakout(highRange, lowRange);
+   if(EnableDebugPrints && breakoutDir != 0)
+      PrintFormat("🚀 BREAKOUT (fresh): %s", breakoutDir == 1 ? "BULLISH" : "BEARISH");
+
+   // fresh FVG result (no globals)
+   int    fvgDir    = 0;
+   double zHigh     = 0.0;
+   double zLow      = 0.0;
+   datetime detectedTime = 0;
+   bool hasFvg = DetectFVG(fvgDir, zHigh, zLow, detectedTime);
+
+   bool freshFvg = hasFvg && (detectedTime != lastProcessedFvgTime);
+   if(freshFvg)
+   {
+      // keep globals in sync for downstream features only (not for entry decisions)
+      lastProcessedFvgTime = detectedTime;
+      fvgDirection = fvgDir;
+      fvgHigh      = zHigh;
+      fvgLow       = zLow;
+      lastFVGTime  = detectedTime;
+      RecordFvgHeight(MathAbs(zHigh - zLow));
+
+      if(EnableDebugPrints)
+         PrintFormat("🎯 FVG (fresh): %s [%.5f-%.5f] @ %s",
+                     fvgDir == 1 ? "BULLISH" : "BEARISH",
+                     zLow, zHigh,
+                     TimeToString(detectedTime, TIME_DATE|TIME_MINUTES));
+   }
+   else
+   {
+      hasFvg = false;  
+      fvgDirection = 0;
+      fvgHigh = fvgLow = 0.0;
+   }
+
+   bool bullSetup = hasFvg && breakoutDir == 1 && fvgDir == 1;
+   bool bearSetup = hasFvg && breakoutDir == -1 && fvgDir == -1;
+
+   int setupDir = 0;
+   if(bullSetup)      setupDir = 1;
+   else if(bearSetup) setupDir = -1;
+
+   if(setupDir == 0)
+   {
+      if(EnableDebugPrints && tickCounter % DebugPrintInterval == 0)
+         Print("🧭 Waiting for simultaneous breakout + FVG.");
+      return;
+   }
+
+   if(!TrendFilterAllows(setupDir))
+   {
+      if(EnableDebugPrints && tickCounter % DebugPrintInterval == 0)
+         Print("⛳ Trend filter blocking trade.");
+      return;
+   }
+
+   double currentAtr = GetVolatilityAtr();
+   if(currentAtr <= 0 || currentAtr < MinATR)
+   {
+      if(EnableDebugPrints && tickCounter % DebugPrintInterval == 0)
+         PrintFormat("🌬️ ATR %.3f below MinATR %.3f — skipping.", currentAtr, MinATR);
+      return;
+   }
+
+   double price     = bid;
+   double fvgHeight = MathAbs(zHigh - zLow);
+   double tolerance = fvgHeight * RetraceTolerancePct;
+
+   if(setupDir == 1)
+   {
+      bool inZone   = (price <= zHigh + tolerance && price >= zLow - tolerance);
+      bool momentum = (AllowMomentumEntry && price > zHigh);
+      if(inZone || momentum)
       {
-         if(EnableDebugPrints && tickCounter % DebugPrintInterval == 0)
-            PrintFormat("⚖️ FVG direction (%s) not aligned with bias (%s). Waiting for alignment.",
-                        fvgDirection == 1 ? "BUY" : "SELL", MarketBias);
+         if(EnableDebugPrints)
+            PrintFormat("🟢 BULLISH ENTRY (fresh): %.5f %s", price, inZone ? "in-zone" : "momentum");
+         PlaceMarketTrade(1, highRange, lowRange, atr);
       }
-      else
+      return;
+   }
+
+   if(setupDir == -1)
+   {
+      bool inZone   = (price >= zLow - tolerance && price <= zHigh + tolerance);
+      bool momentum = (AllowMomentumEntry && price < zLow);
+      if(inZone || momentum)
       {
-         double price = bid;
-         double fvgHeight = MathAbs(fvgHigh - fvgLow);
-         double tolerance = fvgHeight * RetraceTolerancePct;
-
-         if(fvgDirection == 1)
-         {
-            bool inZone = (price <= fvgHigh + tolerance && price >= fvgLow - tolerance);
-            bool momentum = (AllowMomentumEntry && price > fvgHigh);
-
-            if(inZone)
-            {
-               if(EnableDebugPrints)
-                  PrintFormat("🟢 BULLISH ENTRY: %.5f in zone", price);
-               PlaceMarketTrade(1, highRange, lowRange, atr);
-               fvgDirection = 0;
-            }
-            else if(momentum)
-            {
-               if(EnableDebugPrints)
-                  PrintFormat("🟢 MOMENTUM: %.5f > %.5f", price, fvgHigh);
-               PlaceMarketTrade(1, highRange, lowRange, atr);
-               fvgDirection = 0;
-            }
-         }
-         else if(fvgDirection == -1)
-         {
-            bool inZone = (price >= fvgLow - tolerance && price <= fvgHigh + tolerance);
-            bool momentum = (AllowMomentumEntry && price < fvgLow);
-
-            if(inZone)
-            {
-               if(EnableDebugPrints)
-                  PrintFormat("🔴 BEARISH ENTRY: %.5f in zone", price);
-               PlaceMarketTrade(-1, highRange, lowRange, atr);
-               fvgDirection = 0;
-            }
-            else if(momentum)
-            {
-               if(EnableDebugPrints)
-                  PrintFormat("🔴 MOMENTUM: %.5f < %.5f", price, fvgLow);
-               PlaceMarketTrade(-1, highRange, lowRange, atr);
-               fvgDirection = 0;
-            }
-         }
+         if(EnableDebugPrints)
+            PrintFormat("🔴 BEARISH ENTRY (fresh): %.5f %s", price, inZone ? "in-zone" : "momentum");
+         PlaceMarketTrade(-1, highRange, lowRange, atr);
       }
+      return;
    }
 }
 
@@ -420,7 +493,7 @@ double GetATR()
 //+------------------------------------------------------------------+
 void UpdateEquityPeakAndDaily()
 {
-   datetime t = TimeGMT();
+   datetime t = TimeCurrent();
    MqlDateTime dt; TimeToStruct(t, dt);
    
    if(dt.day != LastTradeDay)
@@ -514,7 +587,7 @@ void ManageOpenPositions()
             
             if(StopTradingAfterWin)
             {
-               //StopTrading = true;
+               StopTrading = true;
                Print("🏆 2R WIN - StopTrading activated");
             }
          }
@@ -583,7 +656,7 @@ bool DetectRange(int barsBack, double &highRange, double &lowRange)
    int idxHigh = iHighest(_Symbol, PERIOD_CURRENT, MODE_HIGH, barsBack, 1);
    int idxLow  = iLowest(_Symbol, PERIOD_CURRENT, MODE_LOW, barsBack, 1);
    highRange = iHigh(_Symbol, PERIOD_CURRENT, idxHigh);
-   lowRange  = iLow(_Symbol, PERIOD_CURRENT, idxLow);
+   lowRange  = iLow (_Symbol, PERIOD_CURRENT, idxLow);
 
    double mid = (highRange + lowRange) / 2.0;
    if(mid == 0) return false;
@@ -604,9 +677,14 @@ bool DetectRange(int barsBack, double &highRange, double &lowRange)
 //+------------------------------------------------------------------+
 int DetectBreakout(double highRange, double lowRange)
 {
-   double prevClose = iClose(_Symbol, PERIOD_CURRENT, 1);
-   if(prevClose > highRange) return 1;
-   if(prevClose < lowRange) return -1;
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+
+   if(ask > highRange)
+      return 1;
+   if(bid < lowRange)
+      return -1;
+
    return 0;
 }
 
@@ -746,6 +824,8 @@ void PlaceMarketTrade(int direction, double highRange, double lowRange, double a
       ulong ticket = trade.ResultDeal(); // Use ResultDeal for market orders
       if(ticket == 0) ticket = trade.ResultOrder(); // Fallback
       PrintFormat("✅ OPENED! Ticket=%I64u Deal=%I64u", ticket, trade.ResultDeal());
+      tradesToday++;
+      lastTradeTime = TimeCurrent();
       
       // MODIFIED: Get actual ticket from position
       int total = PositionsTotal();
@@ -1103,7 +1183,7 @@ void ClosePositionsForSymbolAndMagic(string symbol, int magic, const string reas
 
 bool IsWithinNewYorkSession()
 {
-   datetime now = TimeGMT();
+   datetime now = TimeCurrent();
    if(now == 0)
       return false;
 
@@ -1211,7 +1291,7 @@ bool InNewsBlackout()
    if(!UseNewsBlackout || StringLen(NewsBlackoutWindows) == 0)
       return false;
 
-   datetime now   = TimeGMT();
+   datetime now   = TimeCurrent();
    string   today = TimeToString(now, TIME_DATE);
 
    string segments[];
@@ -1248,6 +1328,226 @@ bool InNewsBlackout()
          return true;
    }
    return false;
+}
+
+
+void InitializeHistoricalSignal()
+{
+   historicalSignalPending  = false;
+   historicalSignalConsumed = false;
+   historicalSignalDir      = 0;
+   historicalRangeHigh      = 0.0;
+   historicalRangeLow       = 0.0;
+   historicalFvgHigh        = 0.0;
+   historicalFvgLow         = 0.0;
+   historicalSignalTime     = 0;
+
+   int dir = 0;
+   double rangeHigh = 0.0, rangeLow = 0.0;
+   double zoneHigh = 0.0, zoneLow = 0.0;
+   datetime sigTime = 0;
+
+   if(ScanHistoricalSignal(LookbackBars, dir, rangeHigh, rangeLow, zoneHigh, zoneLow, sigTime))
+   {
+      historicalSignalPending  = true;
+      historicalSignalDir      = dir;
+      historicalRangeHigh      = rangeHigh;
+      historicalRangeLow       = rangeLow;
+      historicalFvgHigh        = zoneHigh;
+      historicalFvgLow         = zoneLow;
+      historicalSignalTime     = sigTime;
+
+      PrintFormat("⏪ Historical signal detected (%s) from %s.",
+                  dir == 1 ? "BUY" : "SELL",
+                  TimeToString(sigTime, TIME_DATE|TIME_MINUTES));
+   }
+}
+
+bool TryExecuteHistoricalSignal(double atr)
+{
+   if(historicalSignalConsumed || !historicalSignalPending)
+      return false;
+
+   if(!IsHistoricalSignalStillValid(historicalSignalDir,
+                                    historicalRangeHigh,
+                                    historicalRangeLow,
+                                    historicalFvgHigh,
+                                    historicalFvgLow))
+   {
+      historicalSignalPending  = false;
+      historicalSignalConsumed = true;
+      if(EnableDebugPrints)
+         Print("⏪ Historical signal invalidated before execution.");
+      return false;
+   }
+
+   if(EnableDebugPrints)
+      PrintFormat("⏪ Executing historical %s signal.",
+                  historicalSignalDir == 1 ? "BUY" : "SELL");
+
+   fvgDirection = historicalSignalDir;
+   fvgHigh      = historicalFvgHigh;
+   fvgLow       = historicalFvgLow;
+   lastProcessedFvgTime = historicalSignalTime;
+   lastFVGTime          = historicalSignalTime;
+
+   PlaceMarketTrade(historicalSignalDir, historicalRangeHigh, historicalRangeLow, atr);
+
+   historicalSignalPending  = false;
+   historicalSignalConsumed = true;
+   return true;
+}
+
+bool ScanHistoricalSignal(int lookbackBars,
+                          int &direction,
+                          double &rangeHigh,
+                          double &rangeLow,
+                          double &zoneHigh,
+                          double &zoneLow,
+                          datetime &signalTime)
+{
+   int totalBars = Bars(_Symbol, PERIOD_CURRENT);
+   if(totalBars < MinBarsInRange + 5)
+      return false;
+
+   int maxShift = MathMin(lookbackBars, totalBars - (MinBarsInRange + 3));
+   if(maxShift < 1)
+      return false;
+
+   for(int shift = 1; shift <= maxShift; ++shift)
+   {
+      int fvgDir = 0;
+      double fh = 0.0, fl = 0.0;
+      datetime fTime = 0;
+      if(!DetectFVGAtShift(shift, fvgDir, fh, fl, fTime))
+         continue;
+
+      double rHigh = 0.0, rLow = 0.0;
+      if(!GetRangeAtShift(shift, MinBarsInRange, rHigh, rLow))
+         continue;
+
+      double closePrice = iClose(_Symbol, PERIOD_CURRENT, shift);
+      int breakoutDir = 0;
+      if(closePrice > rHigh)
+         breakoutDir = 1;
+      else if(closePrice < rLow)
+         breakoutDir = -1;
+
+      if(breakoutDir == 0 || breakoutDir != fvgDir)
+         continue;
+
+      direction = fvgDir;
+      rangeHigh = rHigh;
+      rangeLow  = rLow;
+      zoneHigh  = fh;
+      zoneLow   = fl;
+      signalTime = fTime;
+      return true;
+   }
+   return false;
+}
+
+bool DetectFVGAtShift(int shift,
+                      int &direction,
+                      double &zoneHigh,
+                      double &zoneLow,
+                      datetime &zoneTime)
+{
+   int totalBars = Bars(_Symbol, PERIOD_CURRENT);
+   if(shift + 2 >= totalBars)
+      return false;
+
+   double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   double epsilon = (point > 0.0) ? point * 0.5 : 1e-6;
+
+   double newestLow  = iLow (_Symbol, PERIOD_CURRENT, shift);
+   double newestHigh = iHigh(_Symbol, PERIOD_CURRENT, shift);
+   double oldestHigh = iHigh(_Symbol, PERIOD_CURRENT, shift + 2);
+   double oldestLow  = iLow (_Symbol, PERIOD_CURRENT, shift + 2);
+
+   if(newestLow > oldestHigh + epsilon)
+   {
+      direction = 1;
+      zoneLow   = oldestHigh;
+      zoneHigh  = newestLow;
+      zoneTime  = iTime(_Symbol, PERIOD_CURRENT, shift);
+      return true;
+   }
+
+   if(newestHigh + epsilon < oldestLow)
+   {
+      direction = -1;
+      zoneHigh  = oldestLow;
+      zoneLow   = newestHigh;
+      zoneTime  = iTime(_Symbol, PERIOD_CURRENT, shift);
+      return true;
+   }
+
+   return false;
+}
+
+bool GetRangeAtShift(int shift, int barsBack,
+                     double &highRange, double &lowRange)
+{
+   if(barsBack <= 1)
+      barsBack = 2;
+
+   int idxHigh = iHighest(_Symbol, PERIOD_CURRENT, MODE_HIGH, barsBack, shift);
+   int idxLow  = iLowest (_Symbol, PERIOD_CURRENT, MODE_LOW , barsBack, shift);
+   if(idxHigh < 0 || idxLow < 0)
+      return false;
+
+   highRange = iHigh(_Symbol, PERIOD_CURRENT, idxHigh);
+   lowRange  = iLow (_Symbol, PERIOD_CURRENT, idxLow);
+   return true;
+}
+
+bool IsHistoricalSignalStillValid(int direction,
+                                  double rangeHigh,
+                                  double rangeLow,
+                                  double zoneHigh,
+                                  double zoneLow)
+{
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+
+   if(direction == 1)
+      return (bid >= zoneLow && bid >= rangeLow);
+
+   if(direction == -1)
+      return (ask <= zoneHigh && ask <= rangeHigh);
+
+   return false;
+}
+
+bool TrendFilterAllows(int direction)
+{
+   if(direction == 0 || trend200Handle == INVALID_HANDLE)
+      return false;
+
+   double emaBuf[1];
+   if(CopyBuffer(trend200Handle, 0, 0, 1, emaBuf) != 1)
+      return false;
+
+   double ema = emaBuf[0];
+   double price = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   if(price <= 0 || ema <= 0)
+      return false;
+
+   if(direction == 1)
+      return price > ema;
+   return price < ema;
+}
+
+double GetVolatilityAtr()
+{
+   if(atrVolHandle == INVALID_HANDLE)
+      return 0.0;
+
+   double buf[1];
+   if(CopyBuffer(atrVolHandle, 0, 1, 1, buf) != 1)
+      return 0.0;
+   return buf[0];
 }
 
 int CountDirectionalTrades(int direction)
