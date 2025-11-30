@@ -99,6 +99,41 @@ double recentFvgHeights[];
 const int MAX_FVG_HISTORY = 10;
 bool TrendFilterAllows(int direction);
 double GetVolatilityAtr();
+int  ComputeHistoricalLookback();
+bool StageHistoricalSignal(bool skipExecutedDuplicate);
+bool TryTradeHistoricalSignal(double atr);
+
+
+int watchingFvgIdx[];
+
+bool FiltersPass(int direction,double atr)
+{
+   // Basic example using your existing filters; adjust as needed
+   if(!TrendFilterAllows(direction))
+      return false;
+
+   double volAtr = GetVolatilityAtr();
+   if(volAtr <= 0 || volAtr < MinATR)
+      return false;
+
+   if(InNewsBlackout())
+      return false;
+
+   if(EnableAdxMarketFilter && !PassesAdxState())
+      return false;
+
+   if(EquityPeak > 0 && equity < EquityPeak * (1.0 - EquityMaxDrawdownPercent))
+      return false;
+
+   if(DailyStartEquity > 0 && equity < DailyStartEquity * (1.0 - DailyMaxLossPercent))
+      return false;
+
+   // Directional cap
+   if(EnforceDirectionalCap && CountDirectionalTrades(direction) >= MaxTradesPerDirection)
+      return false;
+
+   return true;
+}
 
 
 //-------------------License Code Start----------------------//
@@ -130,6 +165,22 @@ struct PositionInfo
    double   fvgLower;
 };
 PositionInfo positionTracker[];
+struct FvgInfo
+{
+   int      direction;      // 1 = bullish, -1 = bearish
+   double   low;            // FVG low
+   double   high;           // FVG high
+   datetime time;           // detection time (bar time)
+   bool     mitigated;      // true once fully filled / invalidated
+};
+FvgInfo fvgs[];
+
+
+void   TrackNewFvg(int direction,double zHigh,double zLow,datetime t);
+void   UpdateFvgMitigation();
+int    FindMostRecentValidFvg(int breakoutDir,int &idx);
+void   PlaceFvgLimitOrder(const FvgInfo &fvg,int breakoutDir,double atr);
+
 
 string MarketBias = "NEUTRAL";
 int LastBreakoutDir = 0;
@@ -274,19 +325,21 @@ void OnDeinit(const int reason)
 //+------------------------------------------------------------------+
 void OnTick()
 {
-   // if(!auth)
-   //    return;
-
+   // 1) Housekeeping: equity, risk controls, session checks, cooldown,
+   //    open-position management, etc. — KEEP your existing logic here
+   //    (UpdateEquityPeakAndDaily(), ManageOpenPositions(), session, spread, etc.)
+   //    This block is unchanged except we stop BEFORE any entry logic.
+   // ----------------------------------------------------------------
    tickCounter++;
-   MqlDateTime t;
 
    datetime now = TimeCurrent();
+   MqlDateTime t;
    TimeToStruct(now, t);
    int currentDay = t.day;
 
    if(currentDay != lastResetDay)
    {
-      tradesToday = 0;
+      tradesToday  = 0;
       lastResetDay = currentDay;
    }
 
@@ -300,7 +353,7 @@ void OnTick()
 
    equity = AccountInfoDouble(ACCOUNT_EQUITY);
    UpdateEquityPeakAndDaily();
-   
+
    ManageOpenPositions();
 
    if(!IsWithinNewYorkSession())
@@ -309,7 +362,7 @@ void OnTick()
          Print("🕑 Outside New York session - entries paused.");
       return;
    }
-   
+
    if(StopTrading)
    {
       if(EnableDebugPrints && tickCounter % DebugPrintInterval == 0)
@@ -326,10 +379,11 @@ void OnTick()
    }
 
    double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
-   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-   if(point <= 0) return;
-   
+   double ask   = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double bid   = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   if(point <= 0 || ask <= 0 || bid <= 0)
+      return;
+
    double spreadPoints = (ask - bid) / point;
    if(spreadPoints > MaxSpreadPoints)
    {
@@ -345,13 +399,14 @@ void OnTick()
          Print("❌ ATR unavailable");
       return;
    }
-   
+
    if(atr > MaxATRToTrade)
    {
       if(EnableDebugPrints && tickCounter % (DebugPrintInterval*5) == 0)
          PrintFormat("❌ ATR: %.5f > %.5f", atr, MaxATRToTrade);
       return;
    }
+
    if(tradesToday >= 3)
    {
       if(EnableDebugPrints && tickCounter % DebugPrintInterval == 0)
@@ -366,6 +421,53 @@ void OnTick()
       return;
    }
 
+   // ----------------------------------------------------------------
+   // 2) CONTINUOUSLY detect new FVGs
+   // ----------------------------------------------------------------
+   int    fvgDir    = 0;
+   double zHigh     = 0.0;
+   double zLow      = 0.0;
+   datetime fvgTime = 0;
+
+   bool hasNewFvg = DetectFVG(fvgDir, zHigh, zLow, fvgTime);
+
+   if(hasNewFvg)
+   {
+      // Only track if this FVG is actually new (by time)
+      bool alreadyTracked = false;
+      for(int i = ArraySize(fvgs)-1; i >= 0; --i)
+      {
+         if(fvgs[i].time == fvgTime &&
+            MathAbs(fvgs[i].high - zHigh) < point &&
+            MathAbs(fvgs[i].low  - zLow)  < point)
+         {
+            alreadyTracked = true;
+            break;
+         }
+      }
+
+      if(!alreadyTracked)
+      {
+         TrackNewFvg(fvgDir, zHigh, zLow, fvgTime);
+         RecordFvgHeight(MathAbs(zHigh - zLow));
+
+         if(EnableDebugPrints)
+            PrintFormat("🎯 New FVG tracked: dir=%s [%.5f-%.5f] @ %s",
+                        fvgDir == 1 ? "BULLISH" : "BEARISH",
+                        MathMin(zLow,zHigh), MathMax(zLow,zHigh),
+                        TimeToString(fvgTime, TIME_DATE|TIME_MINUTES));
+      }
+   }
+
+   // ----------------------------------------------------------------
+   // 3) CONTINUOUSLY update FVG mitigation status
+   // ----------------------------------------------------------------
+   UpdateFvgMitigation();
+
+   // ----------------------------------------------------------------
+   // 4) Detect Range and Breakout (BOS) using DetectBreakout()
+   //    NOTE: breakout does NOT need to be on same candle as FVG.
+   // ----------------------------------------------------------------
    double highRange, lowRange;
    bool rangeDetected = DetectRange(MinBarsInRange, highRange, lowRange);
 
@@ -373,109 +475,137 @@ void OnTick()
    {
       int fallbackBars = MathMax(MinBarsInRange, 4);
       int idxHigh = iHighest(_Symbol, PERIOD_CURRENT, MODE_HIGH, fallbackBars, 1);
-      int idxLow  = iLowest (_Symbol, PERIOD_CURRENT, MODE_LOW, fallbackBars, 1);
-      highRange = iHigh(_Symbol, PERIOD_CURRENT, idxHigh);
-      lowRange  = iLow (_Symbol, PERIOD_CURRENT, idxLow);
+      int idxLow  = iLowest (_Symbol, PERIOD_CURRENT, MODE_LOW,  fallbackBars, 1);
+      highRange   = iHigh(_Symbol, PERIOD_CURRENT, idxHigh);
+      lowRange    = iLow (_Symbol, PERIOD_CURRENT, idxLow);
 
       if(EnableDebugPrints && tickCounter % (DebugPrintInterval*2) == 0)
          Print("⏸ No tight range; using fallback envelope.");
    }
-   // fresh breakout result (no globals)
+
    int breakoutDir = DetectBreakout(highRange, lowRange);
    if(EnableDebugPrints && breakoutDir != 0)
-      PrintFormat("🚀 BREAKOUT (fresh): %s", breakoutDir == 1 ? "BULLISH" : "BEARISH");
+      PrintFormat("🚀 BREAKOUT detected: %s",
+                  breakoutDir == 1 ? "BULLISH" : "BEARISH");
 
-   // fresh FVG result (no globals)
-   int    fvgDir    = 0;
-   double zHigh     = 0.0;
-   double zLow      = 0.0;
-   datetime detectedTime = 0;
-   bool hasFvg = DetectFVG(fvgDir, zHigh, zLow, detectedTime);
-
-   bool freshFvg = hasFvg && (detectedTime != lastProcessedFvgTime);
-   if(freshFvg)
+   // ----------------------------------------------------------------
+   // 5) When a BOS occurs, find the most recent valid FVG
+   //    and start WATCHING it for retracement.
+   // ----------------------------------------------------------------
+   if(breakoutDir != 0)
    {
-      // keep globals in sync for downstream features only (not for entry decisions)
-      lastProcessedFvgTime = detectedTime;
-      fvgDirection = fvgDir;
-      fvgHigh      = zHigh;
-      fvgLow       = zLow;
-      lastFVGTime  = detectedTime;
-      RecordFvgHeight(MathAbs(zHigh - zLow));
-
-      if(EnableDebugPrints)
-         PrintFormat("🎯 FVG (fresh): %s [%.5f-%.5f] @ %s",
-                     fvgDir == 1 ? "BULLISH" : "BEARISH",
-                     zLow, zHigh,
-                     TimeToString(detectedTime, TIME_DATE|TIME_MINUTES));
-   }
-   else
-   {
-      hasFvg = false;  
-      fvgDirection = 0;
-      fvgHigh = fvgLow = 0.0;
-   }
-
-   bool bullSetup = hasFvg && breakoutDir == 1 && fvgDir == 1;
-   bool bearSetup = hasFvg && breakoutDir == -1 && fvgDir == -1;
-
-   int setupDir = 0;
-   if(bullSetup)      setupDir = 1;
-   else if(bearSetup) setupDir = -1;
-
-   if(setupDir == 0)
-   {
-      if(EnableDebugPrints && tickCounter % DebugPrintInterval == 0)
-         Print("🧭 Waiting for simultaneous breakout + FVG.");
-      return;
-   }
-
-   if(!TrendFilterAllows(setupDir))
-   {
-      if(EnableDebugPrints && tickCounter % DebugPrintInterval == 0)
-         Print("⛳ Trend filter blocking trade.");
-      return;
-   }
-
-   double currentAtr = GetVolatilityAtr();
-   if(currentAtr <= 0 || currentAtr < MinATR)
-   {
-      if(EnableDebugPrints && tickCounter % DebugPrintInterval == 0)
-         PrintFormat("🌬️ ATR %.3f below MinATR %.3f — skipping.", currentAtr, MinATR);
-      return;
-   }
-
-   double price     = bid;
-   double fvgHeight = MathAbs(zHigh - zLow);
-   double tolerance = fvgHeight * RetraceTolerancePct;
-
-   if(setupDir == 1)
-   {
-      bool inZone   = (price <= zHigh + tolerance && price >= zLow - tolerance);
-      bool momentum = (AllowMomentumEntry && price > zHigh);
-      if(inZone || momentum)
+      int fvgIdx = -1;
+      if(FindMostRecentValidFvg(breakoutDir, fvgIdx) == 1 && fvgIdx >= 0)
       {
-         if(EnableDebugPrints)
-            PrintFormat("🟢 BULLISH ENTRY (fresh): %.5f %s", price, inZone ? "in-zone" : "momentum");
-         PlaceMarketTrade(1, highRange, lowRange, atr);
+         // Avoid duplicates in watching list
+         bool alreadyWatching = false;
+         for(int i = 0; i < ArraySize(watchingFvgIdx); ++i)
+         {
+            if(watchingFvgIdx[i] == fvgIdx)
+            {
+               alreadyWatching = true;
+               break;
+            }
+         }
+
+         if(!alreadyWatching)
+         {
+            int sz = ArraySize(watchingFvgIdx);
+            ArrayResize(watchingFvgIdx, sz + 1);
+            watchingFvgIdx[sz] = fvgIdx;
+
+            if(EnableDebugPrints)
+               PrintFormat("👀 Now watching FVG idx=%d dir=%d [%.5f-%.5f] after BOS.",
+                           fvgIdx,
+                           fvgs[fvgIdx].direction,
+                           fvgs[fvgIdx].low,
+                           fvgs[fvgIdx].high);
+         }
       }
-      return;
+      else if(EnableDebugPrints)
+      {
+         Print("ℹ️ No valid FVG found to watch for this breakout.");
+      }
    }
 
-   if(setupDir == -1)
+   // ----------------------------------------------------------------
+   // 6) For each watched FVG, wait for retracement back into the gap.
+   //    When price retraces into it:
+   //      - Check FiltersPass()
+   //      - PlaceFvgLimitOrder()
+   //      - Stop watching that FVG
+   //    Also ignore FVGs that are mitigated/invalid.
+   // ----------------------------------------------------------------
+   if(ArraySize(watchingFvgIdx) > 0)
    {
-      bool inZone   = (price >= zLow - tolerance && price <= zHigh + tolerance);
-      bool momentum = (AllowMomentumEntry && price < zLow);
-      if(inZone || momentum)
+      double price = (breakoutDir == 1) ? bid : ask; // generic; we use per-FVG direction below
+
+      for(int i = ArraySize(watchingFvgIdx) - 1; i >= 0; --i)
       {
+         int idx = watchingFvgIdx[i];
+         if(idx < 0 || idx >= ArraySize(fvgs))
+         {
+            // Out-of-range index; drop it
+            ArrayRemove(watchingFvgIdx, i);
+            continue;
+         }
+
+         FvgInfo f = fvgs[idx];
+
+         // Drop mitigated/invalid FVGs
+         if(f.mitigated)
+         {
+            if(EnableDebugPrints)
+               PrintFormat("🧹 FVG idx=%d no longer valid (mitigated). Stop watching.", idx);
+            ArrayRemove(watchingFvgIdx, i);
+            continue;
+         }
+
+         // Directional logic: we only act when price RETRACES into the gap
+         double fLow  = MathMin(f.low,  f.high);
+         double fHigh = MathMax(f.low,  f.high);
+         double curBid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+         double curAsk = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+         if(curBid <= 0 || curAsk <= 0)
+            continue;
+
+         bool retraced = false;
+         if(f.direction == 1) // bullish FVG: look for price dipping back into [low,high]
+         {
+            double checkPrice = curBid; // retrace down into the gap
+            retraced = (checkPrice <= fHigh && checkPrice >= fLow);
+         }
+         else if(f.direction == -1) // bearish FVG: look for price rallying back into [low,high]
+         {
+            double checkPrice = curAsk; // retrace up into the gap
+            retraced = (checkPrice >= fLow && checkPrice <= fHigh);
+         }
+
+         if(!retraced)
+            continue;
+
+         // Filters check
+         if(!FiltersPass(f.direction, atr))
+         {
+            if(EnableDebugPrints)
+               PrintFormat("🚫 Filters blocked FVG idx=%d dir=%d.", idx, f.direction);
+            // Optionally stop watching, or keep watching for a later retrace.
+            // Here we drop it to avoid repeated spam.
+            ArrayRemove(watchingFvgIdx, i);
+            continue;
+         }
+
+         // Place limit order at optimal price using PlaceFvgLimitOrder()
          if(EnableDebugPrints)
-            PrintFormat("🔴 BEARISH ENTRY (fresh): %.5f %s", price, inZone ? "in-zone" : "momentum");
-         PlaceMarketTrade(-1, highRange, lowRange, atr);
+            PrintFormat("✅ Retrace detected into FVG idx=%d; placing limit order.", idx);
+
+         PlaceFvgLimitOrder(f, f.direction, atr);
+
+         // Stop watching this FVG after placing the order
+         ArrayRemove(watchingFvgIdx, i);
       }
-      return;
    }
 }
-
 //+------------------------------------------------------------------+
 //| Get ATR                                                           |
 //+------------------------------------------------------------------+
@@ -730,6 +860,125 @@ bool DetectFVG(int &direction, double &zoneHigh, double &zoneLow, datetime &zone
    }
    return false;
 }
+
+void TrackNewFvg(int direction,double zoneHigh,double zoneLow,datetime zoneTime)
+{
+   int size = ArraySize(fvgs);
+   ArrayResize(fvgs,size+1);
+   fvgs[size].direction = direction;
+   fvgs[size].low       = MathMin(zoneLow,zoneHigh);
+   fvgs[size].high      = MathMax(zoneLow,zoneHigh);
+   fvgs[size].time      = zoneTime;
+   fvgs[size].mitigated = false;
+}
+
+void UpdateFvgMitigation()
+{
+   if(ArraySize(fvgs) == 0) return;
+
+   double bid = SymbolInfoDouble(_Symbol,SYMBOL_BID);
+   double ask = SymbolInfoDouble(_Symbol,SYMBOL_ASK);
+   if(bid <= 0 || ask <= 0) return;
+
+   for(int i=0;i<ArraySize(fvgs);++i)
+   {
+      if(fvgs[i].mitigated) continue;
+
+      // fully filled = both sides have traded through the zone
+      bool filled =
+         (bid <= fvgs[i].low  && ask >= fvgs[i].high) ||
+         (bid >= fvgs[i].high && ask <= fvgs[i].low); // safety
+
+      if(filled)
+         fvgs[i].mitigated = true;
+   }
+}
+
+int FindMostRecentValidFvg(int breakoutDir,int &idx)
+{
+   idx = -1;
+   if(breakoutDir == 0) return 0;
+
+   for(int i=ArraySize(fvgs)-1;i>=0;--i)
+   {
+      if(fvgs[i].mitigated) continue;
+      if(fvgs[i].direction != breakoutDir) continue;
+      idx = i;
+      return 1;
+   }
+   return 0;
+}
+
+
+void PlaceFvgLimitOrder(const FvgInfo &fvg,int breakoutDir,double atr)
+{
+   double point = SymbolInfoDouble(_Symbol,SYMBOL_POINT);
+   if(point <= 0) return;
+
+   // Normalize FVG bounds
+   double fLow  = MathMin(fvg.low,  fvg.high);
+   double fHigh = MathMax(fvg.low,  fvg.high);
+   double mid   = (fLow + fHigh) / 2.0;
+
+   double sl  = 0.0;
+   double tp  = 0.0;
+
+   // SL strictly from FVG extremes (+ buffer)
+   if(breakoutDir == 1)           // BUY
+   {
+      sl = fLow - SLBufferPoints * point;      // below FVG low
+      double risk = MathAbs(mid - sl);
+      tp = mid + risk * RR;
+   }
+   else if(breakoutDir == -1)     // SELL
+   {
+      sl = fHigh + SLBufferPoints * point;     // above FVG high
+      double risk = MathAbs(sl - mid);
+      tp = mid - risk * RR;
+   }
+   else
+      return;
+
+   if(sl <= 0 || tp <= 0) return;
+
+   double lots = CalculateLotSize(mid,sl);
+   double minLot = SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_MIN);
+   double maxLot = SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_MAX);
+   double step   = SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_STEP);
+
+   if(minLot <= 0) minLot = 0.01;
+   if(maxLot <= 0) maxLot = 100.0;
+   if(lots < minLot) lots = minLot;
+   if(lots > maxLot) lots = maxLot;
+   if(step > 0) lots = MathFloor(lots/step)*step;
+   lots = NormalizeDouble(lots,2);
+
+   double riskPoints = MathAbs(mid - sl)/point;
+   if(riskPoints < MinimumSlDistancePoints)
+      return;
+
+   if(EnableDebugPrints)
+      PrintFormat("📌 FVG limit: dir=%d Mid=%.5f SL=%.5f TP=%.5f Lots=%.2f",
+                  breakoutDir,mid,sl,tp,lots);
+
+   trade.SetExpertMagicNumber(MagicNumber);
+   trade.SetAsyncMode(false);
+   trade.SetDeviationInPoints(50);
+   trade.SetTypeFilling(ORDER_FILLING_RETURN);
+
+   string comment = (breakoutDir==1) ? "BuyLimit FVG" : "SellLimit FVG";
+   bool ok = false;
+
+   if(breakoutDir == 1)
+      ok = trade.BuyLimit(lots,mid,_Symbol,sl,tp,ORDER_TIME_GTC,0,comment);
+   else
+      ok = trade.SellLimit(lots,mid,_Symbol,sl,tp,ORDER_TIME_GTC,0,comment);
+
+   if(!ok && EnableDebugPrints)
+      PrintFormat("❌ FVG limit failed. Err=%d RetCode=%d %s",
+                  GetLastError(),trade.ResultRetcode(),trade.ResultRetcodeDescription());
+}
+
 
 //+------------------------------------------------------------------+
 //| Place Market Trade                                                |
