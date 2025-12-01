@@ -12,7 +12,7 @@ input double   LotSize                   = 0.10;
 input bool     UseRiskPercent            = true;
 input double   RiskPercent               = 0.2;
 input int      ATRPeriod                 = 14;
-input ENUM_TIMEFRAMES ATRTimeframe       = PERIOD_H1;
+input ENUM_TIMEFRAMES ATRTimeframe       = PERIOD_M30;
 input double   ATRMultiplierSL           = 3.0;
 input double   ATRMultiplierTP           = 2.0;
 input double   SLBufferPoints            = 5.0;
@@ -39,7 +39,7 @@ input int      DebugPrintInterval        = 100;
 
 input bool     UseTrendFilter           = true;
 input int      TrendMAPeriod            = 50;
-input ENUM_TIMEFRAMES TrendMATimeframe  = PERIOD_H1;
+input ENUM_TIMEFRAMES TrendMATimeframe  = PERIOD_M30;
 input double   TrendSlopeMinPoints      = 100;
 
 input bool     EnableAdxMarketFilter    = true;
@@ -64,7 +64,7 @@ input bool     EnablePartialClose       = true;
 input double   PartialCloseFraction     = 0.5;
 input int      CooldownMinutes          = 30;
 input int      LookbackBars             = 200;
-input ENUM_TIMEFRAMES TrendTF           = PERIOD_H1;
+input ENUM_TIMEFRAMES TrendTF           = PERIOD_M30;
 input double   MinATR                   = 0.50; 
 
 // ------------------------ Globals ------------------
